@@ -505,16 +505,13 @@ pub fn init(cx: &mut App) {
 
     cx.on_action(|_: &OpenDevContainer, cx| {
         with_active_or_new_workspace(cx, move |workspace, window, cx| {
-            if !workspace.project().read(cx).is_local() {
+            if let Some(reason) =
+                dev_container::unsupported_reason(workspace.project().read(cx), cx)
+            {
                 cx.spawn_in(window, async move |_, cx| {
-                    cx.prompt(
-                        gpui::PromptLevel::Critical,
-                        "Cannot open Dev Container from remote project",
-                        None,
-                        &["OK"],
-                    )
-                    .await
-                    .ok();
+                    cx.prompt(gpui::PromptLevel::Critical, reason, None, &["OK"])
+                        .await
+                        .ok();
                 })
                 .detach();
                 return;

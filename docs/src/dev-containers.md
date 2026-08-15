@@ -14,6 +14,12 @@ If your repository includes a `.devcontainer/devcontainer.json` file, Zed can op
 - Docker or Podman must be installed and available in your `PATH`. If you use `podman`, you must set the `use_podman` setting in your Zed settings.json to true.
 - Your project must contain a `.devcontainer/devcontainer.json` directory/file.
 
+For a project opened in a WSL distribution, the container engine is driven from
+inside that distribution, so `docker` must be on the `PATH` there — for Docker
+Desktop, that means enabling WSL integration for the distribution. Running the
+engine distro-side is what lets the project's ext4 path be used directly as the
+bind mount source, rather than reaching your files through a filesystem bridge.
+
 By default Zed builds dev container images with BuildKit when the `docker buildx` plugin is available. If your Docker-compatible engine lacks an integrated BuildKit (for example, Apple Container accessed through a Docker-API bridge), set `"dev_container_use_buildkit": false` in your settings.json to use the classic Docker builder instead.
 
 ## Using Dev Containers in Zed

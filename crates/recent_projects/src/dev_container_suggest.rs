@@ -87,15 +87,19 @@ pub fn suggest_on_worktree_updated(
         return;
     }
 
+    // Suggesting is gated on the project rather than on the worktree being a
+    // local one: a project opened in a WSL distribution has remote worktrees
+    // but can still be opened in a container, since the engine is driven from
+    // inside the distribution.
+    if dev_container::unsupported_reason(project.read(cx), cx).is_some() {
+        return;
+    }
+
     let Some(worktree) = project.read(cx).worktree_for_id(worktree_id, cx) else {
         return;
     };
 
     let worktree = worktree.read(cx);
-
-    if !worktree.is_local() {
-        return;
-    }
 
     let has_configs = !find_configs_in_snapshot(worktree).is_empty();
 

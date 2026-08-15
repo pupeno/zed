@@ -28,7 +28,6 @@ use ui::Tooltip;
 use ui::h_flex;
 use ui::rems_from_px;
 use ui::v_flex;
-use util::shell::Shell;
 
 use gpui::{Action, DismissEvent, EventEmitter, FocusHandle, Focusable, RenderOnce};
 use serde::Deserialize;
@@ -38,11 +37,13 @@ use ui::{
     NavigableEntry, ParentElement, Render, Styled, StyledExt, Toggleable, Window, div, rems,
 };
 use util::ResultExt;
+use util::paths::PathStyle;
 use util::rel_path::RelPath;
 use workspace::{ModalView, Workspace, with_active_or_new_workspace};
 
 use http_client::HttpClient;
 
+mod command_host;
 mod command_json;
 mod devcontainer_api;
 mod devcontainer_json;
@@ -95,28 +96,57 @@ fn get_safe_id(input: &str) -> String {
     result
 }
 
+/// Why a dev container cannot be opened for `project`, or `None` if it can.
+///
+/// Opening one means driving the container engine on whichever machine holds
+/// the project, so support comes down to whether we know how to run commands
+/// there. Local projects and projects opened in a WSL distribution qualify.
+pub fn unsupported_reason(project: &project::Project, cx: &App) -> Option<&'static str> {
+    if project.is_via_collab() {
+        return Some("Cannot open Dev Container from a shared project");
+    }
+
+    let connection = project
+        .remote_client()
+        .map(|client| client.read(cx).connection_options());
+    if command_host::host_for_connection(connection.as_ref()).is_none() {
+        return Some("Cannot open Dev Container from this remote project");
+    }
+
+    None
+}
+
 pub struct DevContainerContext {
     pub project_directory: Arc<Path>,
+    pub(crate) project_path_style: PathStyle,
     pub use_podman: bool,
     pub use_buildkit: Option<bool>,
     pub fs: Arc<dyn Fs>,
     pub http_client: Arc<dyn HttpClient>,
     pub environment: WeakEntity<ProjectEnvironment>,
+    pub(crate) host: Arc<dyn command_host::CommandHost>,
 }
 
 impl DevContainerContext {
     pub fn from_workspace(workspace: &Workspace, cx: &App) -> Option<Self> {
-        let project_directory = workspace.project().read(cx).active_project_directory(cx)?;
+        let project = workspace.project().read(cx);
+        let project_directory = project.active_project_directory(cx)?;
+        let connection = project
+            .remote_client()
+            .map(|client| client.read(cx).connection_options());
+        let host = command_host::host_for_connection(connection.as_ref())?;
         let settings = DevContainerSettings::get_global(cx);
         let use_podman = settings.use_podman;
         let use_buildkit = settings.use_buildkit;
         let http_client = cx.http_client().clone();
-        let fs = workspace.app_state().fs.clone();
-        let environment = workspace.project().read(cx).environment().downgrade();
+        let fs = project.fs().clone();
+        let environment = project.environment().downgrade();
         Some(Self {
             project_directory,
+            project_path_style: project.path_style(cx),
             use_podman,
             use_buildkit,
+            host,
             fs,
             http_client,
             environment,
@@ -125,7 +155,7 @@ impl DevContainerContext {
 
     pub async fn environment(&self, cx: &mut impl AppContext) -> HashMap<String, String> {
         let Ok(task) = self.environment.update(cx, |this, cx| {
-            this.local_directory_environment(&Shell::System, self.project_directory.clone(), cx)
+            this.directory_environment(self.project_directory.clone(), cx)
         }) else {
             return HashMap::default();
         };

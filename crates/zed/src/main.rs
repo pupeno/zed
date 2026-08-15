@@ -1258,11 +1258,22 @@ fn handle_open_request(request: OpenRequest, app_state: Arc<AppState>, cx: &mut 
 
     if let Some(connection_options) = request.remote_connection {
         let open_behavior = request.open_behavior;
+        let dev_container = request.dev_container;
         let location = workspace::SerializedWorkspaceLocation::Remote(connection_options.clone());
         let base_open_options = zed::open_options_for_request(open_behavior, &location, cx);
         cx.spawn(async move |cx| {
             let paths: Vec<PathBuf> = request.open_paths.into_iter().map(PathBuf::from).collect();
-            open_remote_project(connection_options, paths, app_state, base_open_options, cx).await
+            open_remote_project(
+                connection_options,
+                paths,
+                app_state,
+                workspace::OpenOptions {
+                    open_in_dev_container: dev_container,
+                    ..base_open_options
+                },
+                cx,
+            )
+            .await
         })
         .detach_and_log_err(cx);
         return;

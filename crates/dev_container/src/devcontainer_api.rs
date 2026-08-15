@@ -17,6 +17,7 @@ use worktree::Snapshot;
 
 use crate::{
     DevContainerContext, DevContainerFeature, DevContainerTemplate,
+    command_host::CommandSpec,
     devcontainer_json::DevContainer,
     devcontainer_manifest::{read_devcontainer_configuration, spawn_dev_container},
     devcontainer_templates_repository, get_latest_oci_manifest, get_oci_token, ghcr_registry,
@@ -101,8 +102,8 @@ impl Display for DevContainerError {
                 ),
                 DevContainerError::DevContainerScriptsFailed =>
                     "lifecycle scripts could not execute for dev container".to_string(),
-                DevContainerError::DevContainerUpFailed(_) => {
-                    "DevContainer creation failed".to_string()
+                DevContainerError::DevContainerUpFailed(message) => {
+                    format!("Dev container creation failed: {message}")
                 }
                 DevContainerError::DevContainerTemplateApplyFailed(_) => {
                     "DevContainer template apply failed".to_string()
@@ -257,7 +258,7 @@ pub async fn start_dev_container_with_config(
     config: Option<DevContainerConfig>,
     environment: HashMap<String, String>,
 ) -> Result<(DevContainerConnection, String), DevContainerError> {
-    check_for_docker(context.use_podman).await?;
+    check_for_docker(&context).await?;
 
     let Some(actual_config) = config.clone() else {
         return Err(DevContainerError::NotInValidProject);
@@ -299,20 +300,22 @@ pub async fn start_dev_container_with_config(
             Ok((connection, remote_workspace_folder))
         }
         Err(err @ DevContainerError::MultipleMatchingContainers(_)) => Err(err),
-        Err(err) => {
-            let message = format!("Failed with nested error: {:?}", err);
-            Err(DevContainerError::DevContainerUpFailed(message))
-        }
+        Err(err @ DevContainerError::DevContainerUpFailed(_)) => Err(err),
+        Err(err) => Err(DevContainerError::DevContainerUpFailed(format!("{err}"))),
     }
 }
 
-async fn check_for_docker(use_podman: bool) -> Result<(), DevContainerError> {
-    let mut command = if use_podman {
-        util::command::new_command("podman")
+async fn check_for_docker(context: &DevContainerContext) -> Result<(), DevContainerError> {
+    // Probe on the machine that will run the engine, not on the one running
+    // Zed: a WSL project uses the distribution's docker even though Zed itself
+    // may have one on the Windows PATH, and the two are not interchangeable.
+    let mut spec = CommandSpec::new(if context.use_podman {
+        "podman"
     } else {
-        util::command::new_command("docker")
-    };
-    command.arg("--version");
+        "docker"
+    });
+    spec.arg("--version");
+    let mut command = context.host.command(spec);
 
     match command.output().await {
         Ok(_) => Ok(()),
@@ -488,7 +491,9 @@ fn get_backup_project_name(remote_workspace_folder: &str, container_id: &str) ->
 mod tests {
     use std::path::PathBuf;
 
-    use crate::devcontainer_api::{DevContainerConfig, find_configs_in_snapshot};
+    use crate::devcontainer_api::{
+        DevContainerConfig, DevContainerError, find_configs_in_snapshot,
+    };
     use fs::FakeFs;
     use gpui::TestAppContext;
     use project::Project;
@@ -501,6 +506,19 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    #[test]
+    fn dev_container_up_errors_include_the_underlying_failure() {
+        let error = DevContainerError::DevContainerUpFailed(
+            "failed while preparing container build resources: Failed to parse file .devcontainer/devcontainer.json"
+                .to_string(),
+        );
+
+        assert_eq!(
+            error.to_string(),
+            "Dev container creation failed: failed while preparing container build resources: Failed to parse file .devcontainer/devcontainer.json"
+        );
     }
 
     #[gpui::test]

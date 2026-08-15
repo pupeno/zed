@@ -10738,6 +10738,7 @@ pub fn open_remote_project_with_new_connection(
     delegate: Arc<dyn RemoteClientDelegate>,
     app_state: Arc<AppState>,
     paths: Vec<PathBuf>,
+    open_in_dev_container: bool,
     cx: &mut App,
 ) -> Task<Result<(Option<Entity<Workspace>>, Vec<Option<Box<dyn ItemHandle>>>)>> {
     cx.spawn(async move |cx| {
@@ -10783,6 +10784,7 @@ pub fn open_remote_project_with_new_connection(
             window,
             None,
             None,
+            open_in_dev_container,
             cx,
         )
         .await?;
@@ -10813,6 +10815,7 @@ pub fn open_remote_project_with_existing_connection(
             window,
             provisional_project_group_key,
             source_workspace,
+            false,
             cx,
         )
         .await
@@ -10828,6 +10831,7 @@ async fn open_remote_project_inner(
     window: WindowHandle<MultiWorkspace>,
     provisional_project_group_key: Option<ProjectGroupKey>,
     source_workspace: Option<WeakEntity<Workspace>>,
+    open_in_dev_container: bool,
     cx: &mut AsyncApp,
 ) -> Result<(Entity<Workspace>, Vec<Option<Box<dyn ItemHandle>>>)> {
     let mut project_paths_to_open = vec![];
@@ -10867,6 +10871,8 @@ async fn open_remote_project_inner(
             if let Some(ref serialized) = serialized_workspace {
                 workspace.centered_layout = serialized.centered_layout;
             }
+
+            workspace.set_open_in_dev_container(open_in_dev_container);
 
             workspace
         });

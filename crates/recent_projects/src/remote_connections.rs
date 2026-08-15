@@ -144,6 +144,12 @@ pub async fn open_remote_project(
     .await;
 
     if let Some((existing_window, existing_workspace)) = existing {
+        if open_options.open_in_dev_container {
+            existing_workspace.update(cx, |workspace, cx| {
+                workspace.set_open_in_dev_container(true);
+                cx.notify();
+            });
+        }
         let remote_connection = cx.update(|cx| {
             existing_workspace
                 .read(cx)
@@ -358,6 +364,7 @@ pub async fn open_remote_project(
                     delegate.clone(),
                     app_state.clone(),
                     paths.clone(),
+                    open_options.open_in_dev_container,
                     cx,
                 )
             })

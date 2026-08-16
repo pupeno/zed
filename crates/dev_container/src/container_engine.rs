@@ -46,7 +46,7 @@ impl CommandSpec {
     }
 }
 
-/// The container engine selected from the project.
+/// The context used to run commands against a container engine.
 ///
 /// Remote connections build their own commands so that each transport controls
 /// quoting, authentication, and process invocation.

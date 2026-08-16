@@ -311,16 +311,17 @@ pub async fn start_dev_container_with_config(
 }
 
 async fn check_for_docker(context: &DevContainerContext) -> Result<(), DevContainerError> {
-    let engine_identity =
-        container_engine_identity(context.engine.as_ref(), context.use_podman).await?;
+    let project_engine = context.engine.as_ref();
+    let project_engine_identity =
+        container_engine_identity(project_engine, context.use_podman).await?;
 
-    if context.engine.requires_local_engine_match_verification() {
+    if project_engine.requires_local_engine_match_verification() {
         let local_engine = crate::container_engine::ContainerEngine::local();
         let local_engine_identity =
             container_engine_identity(&local_engine, context.use_podman).await?;
-        if engine_identity != local_engine_identity {
+        if project_engine_identity != local_engine_identity {
             log::error!(
-                "The container engine ({engine_identity}) differs from the local container engine ({local_engine_identity})"
+                "The project container engine ({project_engine_identity}) differs from the local container engine ({local_engine_identity})"
             );
             return Err(DevContainerError::ContainerEngineNotReachableLocally);
         }

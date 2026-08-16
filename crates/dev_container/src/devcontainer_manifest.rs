@@ -186,18 +186,18 @@ impl DevContainerManifest {
     }
 
     fn identifying_labels(&self) -> Vec<(&str, String)> {
-        let posix_host = self.engine.is_posix();
+        let engine_is_posix = self.engine.is_posix();
         let labels = vec![
             (
                 "devcontainer.local_folder",
                 normalize_label_path(
                     &self.local_project_directory.display().to_string(),
-                    posix_host,
+                    engine_is_posix,
                 ),
             ),
             (
                 "devcontainer.config_file",
-                normalize_label_path(&self.config_file().display().to_string(), posix_host),
+                normalize_label_path(&self.config_file().display().to_string(), engine_is_posix),
             ),
         ];
         labels

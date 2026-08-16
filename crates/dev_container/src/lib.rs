@@ -9,6 +9,7 @@ use http_client::anyhow;
 use picker::Picker;
 use picker::PickerDelegate;
 use project::ProjectEnvironment;
+use remote::RemoteConnectionOptions;
 use settings::RegisterSetting;
 use settings::Settings;
 use std::collections::HashMap;
@@ -105,6 +106,18 @@ fn get_safe_id(input: &str) -> String {
 pub fn unsupported_reason(project: &project::Project, cx: &App) -> Option<&'static str> {
     if project.is_via_collab() {
         return Some("Cannot open Dev Container from a shared project");
+    }
+
+    if project.remote_client().is_some_and(|client| {
+        matches!(
+            client
+                .read(cx)
+                .remote_connection()
+                .map(|connection| connection.connection_options()),
+            Some(RemoteConnectionOptions::Docker(_))
+        )
+    }) {
+        return Some("Project is already open in a Dev Container");
     }
 
     if container_engine_for_project(project, cx).is_none() {

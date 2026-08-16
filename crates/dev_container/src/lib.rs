@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Debug;
 use std::fmt::Display;
+use std::rc::Rc;
 use std::sync::Arc;
 use ui::ActiveTheme;
 use ui::Button;
@@ -51,6 +52,7 @@ mod devcontainer_manifest;
 mod docker;
 mod features;
 mod oci;
+mod project_host;
 
 use devcontainer_api::read_default_devcontainer_configuration;
 
@@ -59,6 +61,7 @@ use crate::devcontainer_api::apply_devcontainer_template;
 use crate::oci::get_deserializable_oci_blob;
 use crate::oci::get_latest_oci_manifest;
 use crate::oci::get_oci_token;
+use crate::project_host::{ProjectHostCapability, RemoteProjectHost};
 
 pub use devcontainer_api::{
     DevContainerConfig, find_configs_in_snapshot, find_devcontainer_configs,
@@ -101,9 +104,13 @@ pub struct DevContainerContext {
     pub project_host: Arc<ProjectHost>,
     pub use_podman: bool,
     pub use_buildkit: Option<bool>,
+    /// The desktop filesystem. Only used for assets the desktop obtains itself
+    /// before they are staged onto the project host; host-side inputs and
+    /// generated host artifacts go through [`DevContainerContext::host`].
     pub fs: Arc<dyn Fs>,
     pub http_client: Arc<dyn HttpClient>,
     pub environment: WeakEntity<ProjectEnvironment>,
+    app: gpui::AsyncApp,
 }
 
 impl DevContainerContext {
@@ -138,7 +145,20 @@ impl DevContainerContext {
             fs,
             http_client,
             environment,
+            app: cx.to_async(),
         })
+    }
+
+    /// The route every host-side Dev Container operation takes.
+    ///
+    /// Reference-counted rather than atomically so, because Dev Container
+    /// startup runs as a single foreground task: staging needs an app context,
+    /// which cannot cross threads.
+    pub(crate) fn host(&self) -> Rc<dyn ProjectHostCapability> {
+        Rc::new(RemoteProjectHost::new(
+            self.project_host.clone(),
+            self.app.clone(),
+        ))
     }
 
     pub async fn environment(&self, cx: &mut impl AppContext) -> HashMap<String, String> {

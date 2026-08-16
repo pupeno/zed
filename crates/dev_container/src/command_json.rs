@@ -1,62 +1,49 @@
 use std::process::Output;
 
-use async_trait::async_trait;
 use serde::Deserialize;
-use util::command::Command;
 
-use crate::devcontainer_api::DevContainerError;
-
-pub(crate) struct DefaultCommandRunner;
-
-impl DefaultCommandRunner {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-}
-
-#[async_trait]
-impl CommandRunner for DefaultCommandRunner {
-    async fn run_command(&self, command: &mut Command) -> Result<Output, std::io::Error> {
-        command.output().await
-    }
-}
-
-#[async_trait]
-pub(crate) trait CommandRunner: Send + Sync {
-    async fn run_command(&self, command: &mut Command) -> Result<Output, std::io::Error>;
-}
+use crate::{
+    devcontainer_api::DevContainerError,
+    project_host::{HostCommand, ProjectHostCapability},
+};
 
 pub(crate) async fn evaluate_json_command<T>(
-    mut command: Command,
+    host: &dyn ProjectHostCapability,
+    command: HostCommand,
 ) -> Result<Option<T>, DevContainerError>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let output = command.output().await.map_err(|e| {
-        log::error!("Error running command {:?}: {e}", command);
-        DevContainerError::CommandFailed(command.get_program().display().to_string())
-    })?;
+    let output = run_on_host(host, &command).await?;
 
     deserialize_json_output(output).map_err(|e| {
         log::error!("Error running command {:?}: {e}", command);
-        DevContainerError::CommandFailed(command.get_program().display().to_string())
+        DevContainerError::CommandFailed(command.program().to_string())
     })
 }
 
 pub(crate) async fn evaluate_yaml_command<T>(
-    mut command: Command,
+    host: &dyn ProjectHostCapability,
+    command: HostCommand,
 ) -> Result<Option<T>, DevContainerError>
 where
     T: for<'de> Deserialize<'de>,
 {
-    let output = command.output().await.map_err(|e| {
-        log::error!("Error running command {:?}: {e}", command);
-        DevContainerError::CommandFailed(command.get_program().display().to_string())
-    })?;
+    let output = run_on_host(host, &command).await?;
 
     deserialize_yaml_output(output).map_err(|e| {
         log::error!("Error running command {:?}: {e}", command);
-        DevContainerError::CommandFailed(command.get_program().display().to_string())
+        DevContainerError::CommandFailed(command.program().to_string())
+    })
+}
+
+async fn run_on_host(
+    host: &dyn ProjectHostCapability,
+    command: &HostCommand,
+) -> Result<Output, DevContainerError> {
+    host.run(command).await.map_err(|e| {
+        log::error!("Error running command {:?}: {e}", command);
+        DevContainerError::CommandFailed(command.program().to_string())
     })
 }
 

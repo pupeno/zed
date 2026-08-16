@@ -121,6 +121,21 @@ impl HostProcess {
     }
 }
 
+#[derive(Clone, Copy)]
+enum PathKind {
+    File,
+    Directory,
+}
+
+impl PathKind {
+    fn powershell_path_type(self) -> &'static str {
+        match self {
+            PathKind::File => "Leaf",
+            PathKind::Directory => "Container",
+        }
+    }
+}
+
 pub struct ProjectHost {
     kind: ProjectHostKind,
     filesystem: ProjectHostFilesystem,
@@ -232,6 +247,88 @@ impl ProjectHost {
             String::from_utf8_lossy(&outcome.stderr)
         );
         Ok(outcome.stdout)
+    }
+
+    pub async fn is_file(&self, path: &Path) -> Result<bool> {
+        self.path_exists(path, PathKind::File).await
+    }
+
+    pub async fn is_dir(&self, path: &Path) -> Result<bool> {
+        self.path_exists(path, PathKind::Directory).await
+    }
+
+    async fn path_exists(&self, path: &Path, kind: PathKind) -> Result<bool> {
+        if self.connection.is_none() {
+            return Ok(match kind {
+                PathKind::File => path.is_file(),
+                PathKind::Directory => path.is_dir(),
+            });
+        }
+
+        let path = path.display().to_string();
+        let request = match self.filesystem.path_style() {
+            PathStyle::Unix => {
+                let test = match kind {
+                    PathKind::File => "-f",
+                    PathKind::Directory => "-d",
+                };
+                HostProcessRequest::new("test", self.project_root()).arguments([test, path.as_str()])
+            }
+            PathStyle::Windows => HostProcessRequest::new("powershell.exe", self.project_root())
+                .arguments([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "if (Test-Path -LiteralPath $args[0] -PathType $args[1]) { exit 0 } else { exit 1 }",
+                    path.as_str(),
+                    kind.powershell_path_type(),
+                ]),
+        };
+        let outcome = self.start_process(request)?.collect_output().await?;
+        Ok(outcome.status.success())
+    }
+
+    /// Copies a directory that already lives on the project host into another
+    /// project-host directory. This is a host-relative filesystem operation, not
+    /// [`ProjectHost::stage_assets`], which moves desktop-local assets onto the host.
+    pub async fn copy_dir(&self, source: &Path, destination: &Path) -> Result<()> {
+        if self.connection.is_none() {
+            return copy_directory(source, destination).with_context(|| {
+                format!(
+                    "copying project host directory {} to {}",
+                    source.display(),
+                    destination.display()
+                )
+            });
+        }
+
+        let source = source.display().to_string();
+        let destination = destination.display().to_string();
+        let request = match self.filesystem.path_style() {
+            PathStyle::Unix => HostProcessRequest::new("sh", self.project_root()).arguments([
+                "-c",
+                "mkdir -p \"$2\" && cp -R \"$1/.\" \"$2\"",
+                "project-host",
+                source.as_str(),
+                destination.as_str(),
+            ]),
+            PathStyle::Windows => HostProcessRequest::new("powershell.exe", self.project_root())
+                .arguments([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "[IO.Directory]::CreateDirectory($args[1]) | Out-Null; Copy-Item -LiteralPath (Join-Path $args[0] '*') -Destination $args[1] -Recurse -Force",
+                    source.as_str(),
+                    destination.as_str(),
+                ]),
+        };
+        let outcome = self.start_process(request)?.collect_output().await?;
+        ensure!(
+            outcome.status.success(),
+            "copying project host directory {source} to {destination} failed: {}",
+            String::from_utf8_lossy(&outcome.stderr)
+        );
+        Ok(())
     }
 
     pub async fn create_dir_all(&self, path: &Path) -> Result<()> {
@@ -499,6 +596,47 @@ mod tests {
     }
 
     #[test]
+    fn local_host_reports_path_kinds_and_copies_host_directories() -> Result<()> {
+        let project_directory = tempdir()?;
+        let host = ProjectHost::local(project_directory.path());
+        let feature_source = project_directory.path().join(".devcontainer/local-feature");
+        let feature_destination = project_directory.path().join("staged/local-feature");
+
+        smol::block_on(async {
+            host.create_dir_all(&feature_source.join("nested")).await?;
+            host.write_file(
+                &feature_source.join("install.sh"),
+                b"#!/bin/sh
+",
+            )
+            .await?;
+            host.write_file(&feature_source.join("nested/extra"), b"extra")
+                .await?;
+
+            assert!(host.is_dir(&feature_source).await?);
+            assert!(!host.is_file(&feature_source).await?);
+            assert!(host.is_file(&feature_source.join("install.sh")).await?);
+            assert!(!host.is_dir(&feature_source.join("install.sh")).await?);
+            assert!(!host.is_file(&feature_source.join("missing")).await?);
+
+            host.copy_dir(&feature_source, &feature_destination).await?;
+
+            assert_eq!(
+                host.read_file(&feature_destination.join("install.sh"))
+                    .await?,
+                b"#!/bin/sh
+"
+            );
+            assert_eq!(
+                host.read_file(&feature_destination.join("nested/extra"))
+                    .await?,
+                b"extra"
+            );
+            Result::<()>::Ok(())
+        })
+    }
+
+    #[test]
     fn local_host_returns_unsuccessful_process_outcomes() -> Result<()> {
         let project_directory = tempdir()?;
         let host = ProjectHost::local(project_directory.path());
@@ -511,6 +649,27 @@ mod tests {
         let outcome = smol::block_on(host.start_process(request)?.collect_output())?;
 
         assert_eq!(outcome.status.code(), Some(7));
+        Ok(())
+    }
+
+    #[test]
+    fn cancelling_a_host_process_stops_it() -> Result<()> {
+        let project_directory = tempdir()?;
+        let host = ProjectHost::local(project_directory.path());
+        let request = if cfg!(windows) {
+            HostProcessRequest::new("cmd.exe", host.project_root())
+                .arguments(["/C", "ping -n 30 127.0.0.1 > NUL"])
+        } else {
+            HostProcessRequest::new("sh", host.project_root()).arguments(["-c", "sleep 30"])
+        };
+
+        let mut process = host.start_process(request)?;
+        let outcome = smol::block_on(async {
+            process.cancel().await?;
+            process.collect_output().await
+        })?;
+
+        assert!(!outcome.status.success());
         Ok(())
     }
 

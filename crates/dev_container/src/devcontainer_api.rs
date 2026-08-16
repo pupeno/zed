@@ -21,6 +21,7 @@ use crate::{
     devcontainer_manifest::{read_devcontainer_configuration, spawn_dev_container},
     devcontainer_templates_repository, get_latest_oci_manifest, get_oci_token, ghcr_registry,
     oci::download_oci_tarball,
+    project_host::{HostCommand, ProjectHostCapability},
 };
 
 /// Represents a discovered devcontainer configuration
@@ -257,7 +258,7 @@ pub async fn start_dev_container_with_config(
     config: Option<DevContainerConfig>,
     environment: HashMap<String, String>,
 ) -> Result<(DevContainerConnection, String), DevContainerError> {
-    check_for_docker(context.use_podman).await?;
+    check_for_docker(&*context.host(), context.use_podman).await?;
 
     let Some(actual_config) = config.clone() else {
         return Err(DevContainerError::NotInValidProject);
@@ -306,18 +307,22 @@ pub async fn start_dev_container_with_config(
     }
 }
 
-async fn check_for_docker(use_podman: bool) -> Result<(), DevContainerError> {
-    let mut command = if use_podman {
-        util::command::new_command("podman")
-    } else {
-        util::command::new_command("docker")
-    };
+async fn check_for_docker(
+    host: &dyn ProjectHostCapability,
+    use_podman: bool,
+) -> Result<(), DevContainerError> {
+    let mut command = HostCommand::new(if use_podman { "podman" } else { "docker" });
     command.arg("--version");
 
-    match command.output().await {
-        Ok(_) => Ok(()),
+    match host.run(&command).await {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::error!("Unable to find docker on the project host: {stderr}");
+            Err(DevContainerError::DockerNotAvailable)
+        }
         Err(e) => {
-            log::error!("Unable to find docker in $PATH: {:?}", e);
+            log::error!("Unable to find docker on the project host: {:?}", e);
             Err(DevContainerError::DockerNotAvailable)
         }
     }
@@ -486,9 +491,14 @@ fn get_backup_project_name(remote_workspace_folder: &str, container_id: &str) ->
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::{path::PathBuf, rc::Rc};
 
-    use crate::devcontainer_api::{DevContainerConfig, find_configs_in_snapshot};
+    use crate::{
+        devcontainer_api::{
+            DevContainerConfig, DevContainerError, check_for_docker, find_configs_in_snapshot,
+        },
+        project_host::test_support::RecordingProjectHost,
+    };
     use fs::FakeFs;
     use gpui::TestAppContext;
     use project::Project;
@@ -496,11 +506,69 @@ mod tests {
     use settings::SettingsStore;
     use util::path;
 
+    const TEST_SOURCE_ROOT: &str = "/path/to/source/project";
+
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    fn recording_host(cx: &mut TestAppContext) -> Rc<RecordingProjectHost> {
+        Rc::new(RecordingProjectHost::new(
+            TEST_SOURCE_ROOT,
+            "/host/tmp",
+            FakeFs::new(cx.executor()),
+        ))
+    }
+
+    #[gpui::test]
+    async fn docker_is_probed_on_the_project_host(cx: &mut TestAppContext) {
+        let host = recording_host(cx);
+
+        check_for_docker(&*host, false).await.unwrap();
+
+        let probes = host.commands_by_program("docker");
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].arguments(), vec!["--version"]);
+        assert_eq!(
+            probes[0].working_directory,
+            PathBuf::from(TEST_SOURCE_ROOT),
+            "the engine that builds the container is the project host's, so probe it there"
+        );
+    }
+
+    #[gpui::test]
+    async fn podman_is_probed_on_the_project_host(cx: &mut TestAppContext) {
+        let host = recording_host(cx);
+
+        check_for_docker(&*host, true).await.unwrap();
+
+        assert_eq!(host.commands_by_program("podman").len(), 1);
+        assert!(host.commands_by_program("docker").is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_project_host_without_docker_reports_it_as_unavailable(cx: &mut TestAppContext) {
+        let host = recording_host(cx);
+        host.fail_program("docker");
+
+        let result = check_for_docker(&*host, false).await;
+
+        assert!(matches!(result, Err(DevContainerError::DockerNotAvailable)));
+    }
+
+    #[gpui::test]
+    async fn a_project_host_that_cannot_be_reached_reports_docker_as_unavailable(
+        cx: &mut TestAppContext,
+    ) {
+        let host = recording_host(cx);
+        host.fail_to_start("docker");
+
+        let result = check_for_docker(&*host, false).await;
+
+        assert!(matches!(result, Err(DevContainerError::DockerNotAvailable)));
     }
 
     #[gpui::test]

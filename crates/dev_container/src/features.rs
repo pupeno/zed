@@ -1,12 +1,12 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf};
 
-use fs::Fs;
 use serde::Deserialize;
 use serde_json_lenient::Value;
 
 use crate::{
     devcontainer_api::DevContainerError,
     devcontainer_json::{FeatureOptions, MountDefinition},
+    project_host::ProjectHostCapability,
     safe_id_upper,
 };
 
@@ -167,7 +167,7 @@ RUN chmod -R 0755 {full_dest} \
 
     pub(crate) async fn write_feature_env(
         &self,
-        fs: &Arc<dyn Fs>,
+        host: &dyn ProjectHostCapability,
         options: &FeatureOptions,
     ) -> Result<String, DevContainerError> {
         let merged_env = self.generate_merged_env(options);
@@ -179,7 +179,7 @@ RUN chmod -R 0755 {full_dest} \
             .iter()
             .fold("".to_string(), |acc, (k, v)| format!("{acc}{}={}\n", k, v));
 
-        fs.write(
+        host.write_file(
             &self.file_path.join("devcontainer-features.env"),
             env_file_content.as_bytes(),
         )

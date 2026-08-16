@@ -330,14 +330,6 @@ async fn check_for_docker(context: &DevContainerContext) -> Result<(), DevContai
     Ok(())
 }
 
-fn container_engine_identity_format(use_podman: bool) -> &'static str {
-    if use_podman {
-        "{{.Host.Hostname}}:{{.Store.GraphRoot}}:{{.Store.RunRoot}}"
-    } else {
-        "{{.ID}}"
-    }
-}
-
 async fn container_engine_identity(
     engine: &crate::container_engine::ContainerEngine,
     use_podman: bool,
@@ -373,6 +365,14 @@ async fn container_engine_identity(
     }
 
     Ok(engine_identity)
+}
+
+fn container_engine_identity_format(use_podman: bool) -> &'static str {
+    if use_podman {
+        "{{.Host.Hostname}}:{{.Store.GraphRoot}}:{{.Store.RunRoot}}"
+    } else {
+        "{{.ID}}"
+    }
 }
 
 pub(crate) async fn apply_devcontainer_template(

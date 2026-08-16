@@ -223,8 +223,17 @@ impl Docker {
         } else {
             let mut spec = CommandSpec::new(docker_cli);
             spec.args(["buildx", "version"]);
-            let output = host.command(spec).output().await;
-            output.map(|o| o.status.success()).unwrap_or(false)
+            match host.command(spec) {
+                Ok(mut command) => command
+                    .output()
+                    .await
+                    .map(|output| output.status.success())
+                    .unwrap_or(false),
+                Err(error) => {
+                    log::error!("Unable to construct docker buildx command: {error:?}");
+                    false
+                }
+            }
         };
         if !has_buildx && docker_cli != "podman" {
             log::info!(
@@ -248,10 +257,17 @@ impl Docker {
         CommandSpec::new(&self.docker_cli)
     }
 
+    fn command(&self, spec: CommandSpec) -> Result<Command, DevContainerError> {
+        self.host.command(spec).map_err(|error| {
+            log::error!("Unable to construct {} command: {error:?}", self.docker_cli);
+            DevContainerError::CommandFailed(self.docker_cli.clone())
+        })
+    }
+
     async fn pull_image(&self, image: &String) -> Result<(), DevContainerError> {
         let mut spec = self.spec();
         spec.args(&["pull", "--", image]);
-        let mut command = self.host.command(spec);
+        let mut command = self.command(spec)?;
 
         let output = command.output().await.map_err(|e| {
             log::error!("Error pulling image: {e}");
@@ -266,7 +282,10 @@ impl Docker {
         Ok(())
     }
 
-    fn create_docker_query_containers(&self, filters: Vec<String>) -> Command {
+    fn create_docker_query_containers(
+        &self,
+        filters: Vec<String>,
+    ) -> Result<Command, DevContainerError> {
         let mut spec = self.spec();
         spec.args(&["ps", "-a"]);
 
@@ -275,23 +294,26 @@ impl Docker {
             spec.arg(filter);
         }
         spec.arg("--format={{ json . }}");
-        self.host.command(spec)
+        self.command(spec)
     }
 
-    fn create_docker_inspect(&self, id: &str) -> Command {
+    fn create_docker_inspect(&self, id: &str) -> Result<Command, DevContainerError> {
         let mut spec = self.spec();
         spec.args(&["inspect", "--format={{json . }}", id]);
-        self.host.command(spec)
+        self.command(spec)
     }
 
-    fn create_docker_compose_config_command(&self, config_files: &Vec<PathBuf>) -> Command {
+    fn create_docker_compose_config_command(
+        &self,
+        config_files: &Vec<PathBuf>,
+    ) -> Result<Command, DevContainerError> {
         let mut spec = self.spec();
         spec.arg("compose");
         for file_path in config_files {
             spec.args(&["-f", &file_path.display().to_string()]);
         }
         spec.arg("config");
-        self.host.command(spec)
+        self.command(spec)
     }
 }
 
@@ -299,7 +321,7 @@ impl Docker {
 impl DockerClient for Docker {
     async fn inspect(&self, id: &String) -> Result<DockerInspect, DevContainerError> {
         // Always try inspect first — avoid pulling unless necessary.
-        let command = self.create_docker_inspect(id);
+        let command = self.create_docker_inspect(id)?;
         match evaluate_json_command::<DockerInspect>(command).await {
             Ok(Some(docker_inspect)) => return Ok(docker_inspect),
             Ok(None) | Err(_) => {}
@@ -308,7 +330,7 @@ impl DockerClient for Docker {
         // Inspect failed — try pulling and retry.
         self.pull_image(id).await.ok();
 
-        let command = self.create_docker_inspect(id);
+        let command = self.create_docker_inspect(id)?;
         let Some(docker_inspect): Option<DockerInspect> = evaluate_json_command(command).await?
         else {
             log::error!("Docker inspect produced no deserializable output");
@@ -321,7 +343,7 @@ impl DockerClient for Docker {
         &self,
         config_files: &Vec<PathBuf>,
     ) -> Result<Option<DockerComposeConfig>, DevContainerError> {
-        let command = self.create_docker_compose_config_command(config_files);
+        let command = self.create_docker_compose_config_command(config_files)?;
         evaluate_yaml_command(command).await
     }
 
@@ -352,7 +374,7 @@ impl DockerClient for Docker {
             spec.args(services);
         }
 
-        let output = self.host.command(spec).output().await.map_err(|e| {
+        let output = self.command(spec)?.output().await.map_err(|e| {
             log::error!("Error running docker compose up: {e}");
             DevContainerError::CommandFailed(self.docker_cli.clone())
         })?;
@@ -396,7 +418,7 @@ impl DockerClient for Docker {
         inner_program_script.append(&mut args);
         spec.args(&["-c", &inner_program_script.join(" ")]);
 
-        let output = self.host.command(spec).output().await.map_err(|e| {
+        let output = self.command(spec)?.output().await.map_err(|e| {
             log::error!("Error running command {e} in container exec");
             DevContainerError::ContainerNotValid(container_id.to_string())
         })?;
@@ -415,7 +437,7 @@ impl DockerClient for Docker {
 
         spec.args(&["start", id]);
 
-        let output = self.host.command(spec).output().await.map_err(|e| {
+        let output = self.command(spec)?.output().await.map_err(|e| {
             log::error!("Error running docker start: {e}");
             DevContainerError::CommandFailed(self.docker_cli.clone())
         })?;
@@ -433,7 +455,7 @@ impl DockerClient for Docker {
         &self,
         filters: Vec<String>,
     ) -> Result<Option<DockerPs>, DevContainerError> {
-        let mut command = self.create_docker_query_containers(filters);
+        let mut command = self.create_docker_query_containers(filters)?;
         let output = command.output().await.map_err(|e| {
             log::error!("Error running command {:?}: {e}", command);
             DevContainerError::CommandFailed(command.get_program().display().to_string())
@@ -901,7 +923,9 @@ mod test {
         };
         let given_id = "given_docker_id";
 
-        let command = docker.create_docker_inspect(given_id);
+        let command = docker
+            .create_docker_inspect(given_id)
+            .expect("command builds");
 
         assert_eq!(
             command.get_args().collect::<Vec<&OsStr>>(),

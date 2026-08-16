@@ -1,17 +1,17 @@
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use remote::RemoteConnectionOptions;
+use anyhow::Result;
+use remote::{Interactive, RemoteConnection, RemoteConnectionOptions};
 use util::command::Command;
+use util::paths::PathStyle;
 
 /// A command to run against the container engine, described as plain data.
 ///
-/// The engine does not always live on the machine running Zed — for a project
-/// opened over WSL it lives inside the distribution — so the whole invocation
-/// (program, arguments and environment) has to be known before it can be
-/// wrapped for its destination. Building a `Command` incrementally would leave
-/// nothing left to wrap.
+/// Remote command transports wrap the complete invocation, including its
+/// program, arguments, and environment.
 #[derive(Debug, Clone)]
 pub(crate) struct CommandSpec {
     program: String,
@@ -54,18 +54,16 @@ impl CommandSpec {
 
 /// Where the container engine runs.
 pub(crate) trait CommandHost: Debug + Send + Sync {
-    fn command(&self, spec: CommandSpec) -> Command;
+    fn command(&self, spec: CommandSpec) -> Result<Command>;
+
+    /// Whether Zed must verify that this host uses the local container engine.
+    fn requires_local_engine_match_verification(&self) -> bool;
 
     /// Maps a path understood by the container engine to a path that the Zed
     /// client can use with its local filesystem implementation.
     fn filesystem_path(&self, path: &Path) -> PathBuf;
 
     /// Whether the host has posix user and path semantics.
-    ///
-    /// Several decisions — remapping the container user's uid, and the shape
-    /// of the paths recorded in container labels — depend on the machine the
-    /// engine runs on, not on the machine running Zed. Those coincide for a
-    /// local project and diverge for a project opened in WSL.
     fn is_posix(&self) -> bool;
 }
 
@@ -74,17 +72,22 @@ pub(crate) trait CommandHost: Debug + Send + Sync {
 pub(crate) struct LocalCommandHost;
 
 impl CommandHost for LocalCommandHost {
+    fn requires_local_engine_match_verification(&self) -> bool {
+        // Local commands always select Zed's engine.
+        false
+    }
+
     fn is_posix(&self) -> bool {
         cfg!(not(target_os = "windows"))
     }
 
-    fn command(&self, spec: CommandSpec) -> Command {
+    fn command(&self, spec: CommandSpec) -> Result<Command> {
         let mut command = Command::new(&spec.program);
         command.args(&spec.args);
         for (key, value) in &spec.env {
             command.env(key, value);
         }
-        command
+        Ok(command)
     }
 
     fn filesystem_path(&self, path: &Path) -> PathBuf {
@@ -94,12 +97,9 @@ impl CommandHost for LocalCommandHost {
 
 /// The engine is reached from inside a WSL distribution.
 ///
-/// This is what makes a dev container for a project on the distro's ext4 come
-/// out right: the daemon receives the project's native posix path as the bind
-/// mount source and resolves it as a block device. Invoking the engine from
-/// the Windows side instead would mean handing it a `\\wsl.localhost` or
-/// `/mnt/c` path, which either fails or silently downgrades the mount to a
-/// filesystem bridge.
+/// The WSL invocation preserves the project's native POSIX bind-mount source.
+/// A Windows-side invocation supplies a `\\wsl.localhost` or `/mnt/c` path,
+/// which the engine may reject or access through a filesystem bridge.
 #[derive(Debug)]
 pub(crate) struct WslCommandHost {
     distro_name: String,
@@ -107,11 +107,15 @@ pub(crate) struct WslCommandHost {
 }
 
 impl CommandHost for WslCommandHost {
+    fn requires_local_engine_match_verification(&self) -> bool {
+        true
+    }
+
     fn is_posix(&self) -> bool {
         true
     }
 
-    fn command(&self, spec: CommandSpec) -> Command {
+    fn command(&self, spec: CommandSpec) -> Result<Command> {
         let mut command = Command::new("wsl.exe");
         command.arg("-d").arg(&self.distro_name);
         if let Some(user) = &self.user {
@@ -133,7 +137,7 @@ impl CommandHost for WslCommandHost {
 
         command.arg(&spec.program);
         command.args(&spec.args);
-        command
+        Ok(command)
     }
 
     fn filesystem_path(&self, path: &Path) -> PathBuf {
@@ -157,18 +161,70 @@ impl CommandHost for WslCommandHost {
     }
 }
 
-/// Returns the host to drive the container engine through for a project on
-/// `connection`, or `None` for a connection we cannot yet run commands on.
-pub(crate) fn host_for_connection(
-    connection: Option<&RemoteConnectionOptions>,
-) -> Option<std::sync::Arc<dyn CommandHost>> {
-    match connection {
-        None => Some(std::sync::Arc::new(LocalCommandHost)),
-        Some(RemoteConnectionOptions::Wsl(options)) => Some(std::sync::Arc::new(WslCommandHost {
+/// Runs commands through an established remote connection.
+pub(crate) struct RemoteCommandHost {
+    connection: Arc<dyn RemoteConnection>,
+    path_style: PathStyle,
+}
+
+impl Debug for RemoteCommandHost {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RemoteCommandHost")
+            .field("connection", &self.connection.connection_options())
+            .finish()
+    }
+}
+
+impl CommandHost for RemoteCommandHost {
+    fn requires_local_engine_match_verification(&self) -> bool {
+        true
+    }
+
+    fn is_posix(&self) -> bool {
+        self.path_style == PathStyle::Unix
+    }
+
+    fn command(&self, spec: CommandSpec) -> Result<Command> {
+        let args = spec.args;
+        let environment = spec.env.into_iter().collect();
+        let template = self.connection.build_command(
+            Some(spec.program),
+            &args,
+            &environment,
+            None,
+            None,
+            Interactive::No,
+        )?;
+        let mut command = Command::new(template.program);
+        command.args(template.args);
+        for (key, value) in template.env {
+            command.env(key, value);
+        }
+        Ok(command)
+    }
+
+    fn filesystem_path(&self, path: &Path) -> PathBuf {
+        path.to_path_buf()
+    }
+}
+
+/// Returns the host to drive the container engine through for an established
+/// remote connection. WSL keeps a specialized filesystem mapping so that the
+/// Windows client can read the distro's files; every other connection uses the
+/// transport's generic command builder.
+pub(crate) fn host_for_remote_connection(
+    connection: Arc<dyn RemoteConnection>,
+) -> Arc<dyn CommandHost> {
+    match connection.connection_options() {
+        RemoteConnectionOptions::Wsl(options) => Arc::new(WslCommandHost {
             distro_name: options.distro_name.clone(),
             user: options.user.clone(),
-        })),
-        Some(_) => None,
+        }),
+        _ => Arc::new(RemoteCommandHost {
+            path_style: connection.path_style(),
+            connection,
+        }),
     }
 }
 
@@ -189,9 +245,20 @@ mod tests {
         spec.args(["ps", "-a"]);
 
         assert_eq!(
-            rendered(&LocalCommandHost.command(spec)),
+            rendered(&LocalCommandHost.command(spec).expect("command builds")),
             ["docker", "ps", "-a"]
         );
+    }
+
+    #[test]
+    fn only_local_hosts_skip_local_engine_match_verification() {
+        let wsl_host = WslCommandHost {
+            distro_name: "Ubuntu".into(),
+            user: None,
+        };
+
+        assert!(!LocalCommandHost.requires_local_engine_match_verification());
+        assert!(wsl_host.requires_local_engine_match_verification());
     }
 
     #[test]
@@ -204,7 +271,7 @@ mod tests {
         spec.args(["ps", "-a"]);
 
         assert_eq!(
-            rendered(&host.command(spec)),
+            rendered(&host.command(spec).expect("command builds")),
             ["wsl.exe", "-d", "Ubuntu", "--", "docker", "ps", "-a"]
         );
     }
@@ -222,7 +289,7 @@ mod tests {
         spec.args(["compose", "build"]);
 
         assert_eq!(
-            rendered(&host.command(spec)),
+            rendered(&host.command(spec).expect("command builds")),
             [
                 "wsl.exe",
                 "-d",
@@ -271,7 +338,9 @@ mod tests {
         ]);
 
         assert_eq!(
-            rendered(&host.command(spec)).last().unwrap(),
+            rendered(&host.command(spec).expect("command builds"))
+                .last()
+                .expect("command has arguments"),
             "devcontainer.local_folder=/home/test-user/example project"
         );
     }

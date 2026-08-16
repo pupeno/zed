@@ -87,10 +87,8 @@ pub fn suggest_on_worktree_updated(
         return;
     }
 
-    // Suggesting is gated on the project rather than on the worktree being a
-    // local one: a project opened in a WSL distribution has remote worktrees
-    // but can still be opened in a container, since the engine is driven from
-    // inside the distribution.
+    // The project-level gate accounts for remote connections that can run the
+    // container CLI and use the same engine as Zed.
     if dev_container::unsupported_reason(project.read(cx), cx).is_some() {
         return;
     }

@@ -72,6 +72,7 @@ pub(crate) struct DevContainerApply {
 pub enum DevContainerError {
     CommandFailed(String),
     DockerNotAvailable,
+    ContainerEngineNotReachableLocally,
     ContainerNotValid(String),
     DevContainerTemplateApplyFailed(String),
     DevContainerScriptsFailed,
@@ -96,7 +97,10 @@ impl Display for DevContainerError {
             "{}",
             match self {
                 DevContainerError::DockerNotAvailable =>
-                    "docker CLI not found on $PATH".to_string(),
+                    "Docker or Podman CLI/engine is not available".to_string(),
+                DevContainerError::ContainerEngineNotReachableLocally =>
+                    "The container engine accessed from the project differs from the one accessed by Zed making it impossible for Zed to open this dev container."
+                        .to_string(),
                 DevContainerError::ContainerNotValid(id) => format!(
                     "docker image {id} did not have expected configuration for a dev container"
                 ),
@@ -306,24 +310,67 @@ pub async fn start_dev_container_with_config(
 }
 
 async fn check_for_docker(context: &DevContainerContext) -> Result<(), DevContainerError> {
-    // Probe on the machine that will run the engine, not on the one running
-    // Zed: a WSL project uses the distribution's docker even though Zed itself
-    // may have one on the Windows PATH, and the two are not interchangeable.
-    let mut spec = CommandSpec::new(if context.use_podman {
-        "podman"
-    } else {
-        "docker"
-    });
-    spec.arg("--version");
-    let mut command = context.host.command(spec);
+    let engine_identity =
+        container_engine_identity(context.host.as_ref(), context.use_podman).await?;
 
-    match command.output().await {
-        Ok(_) => Ok(()),
-        Err(e) => {
-            log::error!("Unable to find docker in $PATH: {:?}", e);
-            Err(DevContainerError::DockerNotAvailable)
+    if context.host.requires_local_engine_match_verification() {
+        let local_host = crate::command_host::LocalCommandHost;
+        let local_engine_identity =
+            container_engine_identity(&local_host, context.use_podman).await?;
+        if engine_identity != local_engine_identity {
+            log::error!(
+                "The container engine ({engine_identity}) differs from the local container engine ({local_engine_identity})"
+            );
+            return Err(DevContainerError::ContainerEngineNotReachableLocally);
         }
     }
+
+    Ok(())
+}
+
+fn container_engine_identity_format(use_podman: bool) -> &'static str {
+    if use_podman {
+        "{{.Host.Hostname}}:{{.Store.GraphRoot}}:{{.Store.RunRoot}}"
+    } else {
+        "{{.ID}}"
+    }
+}
+
+async fn container_engine_identity(
+    host: &dyn crate::command_host::CommandHost,
+    use_podman: bool,
+) -> Result<String, DevContainerError> {
+    let engine_cli = if use_podman { "podman" } else { "docker" };
+    let mut spec = CommandSpec::new(engine_cli);
+    spec.args([
+        "info",
+        "--format",
+        container_engine_identity_format(use_podman),
+    ]);
+    let mut command = host.command(spec).map_err(|error| {
+        log::error!("Unable to construct {engine_cli} info command: {error:?}");
+        DevContainerError::DockerNotAvailable
+    })?;
+    let output = command.output().await.map_err(|error| {
+        log::error!("Unable to run {engine_cli} info: {error:?}");
+        DevContainerError::DockerNotAvailable
+    })?;
+
+    if !output.status.success() {
+        log::error!(
+            "{engine_cli} info failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return Err(DevContainerError::DockerNotAvailable);
+    }
+
+    let engine_identity = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if engine_identity.is_empty() {
+        log::error!("{engine_cli} info did not return an engine identity");
+        return Err(DevContainerError::DockerNotAvailable);
+    }
+
+    Ok(engine_identity)
 }
 
 pub(crate) async fn apply_devcontainer_template(
@@ -518,6 +565,15 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "Dev container creation failed: failed while preparing container build resources: Failed to parse file .devcontainer/devcontainer.json"
+        );
+    }
+
+    #[test]
+    fn container_engine_identity_formats_match_the_cli_info_schema() {
+        assert_eq!(super::container_engine_identity_format(false), "{{.ID}}");
+        assert_eq!(
+            super::container_engine_identity_format(true),
+            "{{.Host.Hostname}}:{{.Store.GraphRoot}}:{{.Store.RunRoot}}"
         );
     }
 

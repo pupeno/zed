@@ -98,22 +98,33 @@ fn get_safe_id(input: &str) -> String {
 
 /// Why a dev container cannot be opened for `project`, or `None` if it can.
 ///
-/// Opening one means driving the container engine on whichever machine holds
-/// the project, so support comes down to whether we know how to run commands
-/// there. Local projects and projects opened in a WSL distribution qualify.
+/// Opening one means driving the container engine from whichever connection
+/// owns the project. An established remote connection can construct those
+/// commands, while container creation verifies that its project paths can be
+/// mounted by the engine Zed uses locally.
 pub fn unsupported_reason(project: &project::Project, cx: &App) -> Option<&'static str> {
     if project.is_via_collab() {
         return Some("Cannot open Dev Container from a shared project");
     }
 
-    let connection = project
-        .remote_client()
-        .map(|client| client.read(cx).connection_options());
-    if command_host::host_for_connection(connection.as_ref()).is_none() {
+    if command_host_for_project(project, cx).is_none() {
         return Some("Cannot open Dev Container from this remote project");
     }
 
     None
+}
+
+fn command_host_for_project(
+    project: &project::Project,
+    cx: &App,
+) -> Option<Arc<dyn command_host::CommandHost>> {
+    match project.remote_client() {
+        Some(client) => client
+            .read(cx)
+            .remote_connection()
+            .map(command_host::host_for_remote_connection),
+        None => Some(Arc::new(command_host::LocalCommandHost)),
+    }
 }
 
 pub struct DevContainerContext {
@@ -131,10 +142,7 @@ impl DevContainerContext {
     pub fn from_workspace(workspace: &Workspace, cx: &App) -> Option<Self> {
         let project = workspace.project().read(cx);
         let project_directory = project.active_project_directory(cx)?;
-        let connection = project
-            .remote_client()
-            .map(|client| client.read(cx).connection_options());
-        let host = command_host::host_for_connection(connection.as_ref())?;
+        let host = command_host_for_project(project, cx)?;
         let settings = DevContainerSettings::get_global(cx);
         let use_podman = settings.use_podman;
         let use_buildkit = settings.use_buildkit;

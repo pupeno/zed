@@ -154,6 +154,13 @@ impl DevContainerManifest {
         project_temporary_directory(self.project_path_style)
     }
 
+    fn host_command(&self, spec: CommandSpec) -> Result<Command, DevContainerError> {
+        self.host.command(spec).map_err(|error| {
+            log::error!("Failed to construct command for the container engine: {error:?}");
+            DevContainerError::CommandFailed(self.docker_client.docker_cli())
+        })
+    }
+
     /// Reads a numeric id from `id` on the machine that hosts the engine.
     ///
     /// This has to run there rather than locally: the value remaps the
@@ -166,7 +173,7 @@ impl DevContainerManifest {
         spec.arg(flag);
         let label = format!("id {flag}");
 
-        let output = self.host.command(spec).output().await.map_err(|e| {
+        let output = self.host_command(spec)?.output().await.map_err(|e| {
             log::error!("Failed to get host id ({flag}): {e}");
             DevContainerError::CommandFailed(label.clone())
         })?;
@@ -1721,7 +1728,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
             ));
         }
 
-        // After a successful build, inspect the newly tagged image to get its metadata
+        // Inspect the tagged image to obtain its metadata.
         let Some(features_build_info) = &self.features_build_info else {
             log::error!("Features build info expected, but not created");
             return Err(DevContainerError::DevContainerParseFailed);
@@ -1738,10 +1745,8 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
         &self,
         image: &DockerInspect,
     ) -> Result<bool, DevContainerError> {
-        // Remapping only means anything where the bind mount carries real
-        // ownership. A project on the machine running Zed under Windows has no
-        // uid to match; one reached through WSL does, even though Zed itself
-        // is the same Windows build.
+        // UID remapping requires POSIX ownership semantics on the engine host;
+        // Windows filesystem paths have no uid to match.
         if !self.host.is_posix() {
             return Ok(false);
         }
@@ -1818,7 +1823,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
         spec.args(["--build-arg", &format!("IMAGE_USER={}", image_user)]);
         spec.arg(features_build_info.empty_context_dir.display().to_string());
 
-        let mut command = self.host.command(spec);
+        let mut command = self.host_command(spec)?;
         let output = self
             .command_runner
             .run_command(&mut command)
@@ -1930,7 +1935,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             &features_content_dir.display().to_string(),
         ]);
 
-        let mut command = self.host.command(spec);
+        let mut command = self.host_command(spec)?;
         let output = self
             .command_runner
             .run_command(&mut command)
@@ -2057,7 +2062,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             spec.arg(features_build_info.empty_context_dir.display().to_string());
         }
 
-        Ok(self.host.command(spec))
+        self.host_command(spec)
     }
 
     async fn run_docker_compose(
@@ -2103,7 +2108,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             spec.args(services);
         }
 
-        let mut command = self.host.command(spec);
+        let mut command = self.host_command(spec)?;
         let output = self
             .command_runner
             .run_command(&mut command)
@@ -2345,7 +2350,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             spec.arg(&build_resources.image_tag);
         }
 
-        Ok(self.host.command(spec))
+        self.host_command(spec)
     }
 
     fn extension_ids(&self) -> Vec<String> {
@@ -3567,9 +3572,8 @@ fn build_devcontainer_metadata_entry(
         .collect()
 }
 
-/// Renders a path the way the machine hosting the container engine writes it,
-/// so that labels match on a later lookup and an existing container is found
-/// again instead of being rebuilt.
+/// Renders a path in the engine host's form so identifying labels locate an
+/// existing container.
 fn normalize_label_path(path: &str, posix_host: bool) -> String {
     if posix_host {
         return path.to_string();
@@ -3636,8 +3640,8 @@ mod test {
         },
         oci::TokenResponse,
     };
-    /// Tests drive a `LocalCommandHost`, so the host's posix-ness tracks the
-    /// build target the same way it did before the host became explicit.
+    /// Tests drive a `LocalCommandHost`, so its POSIX setting follows the build
+    /// target.
     const POSIX_TEST_HOST: bool = cfg!(not(target_os = "windows"));
 
     #[cfg(not(target_os = "windows"))]

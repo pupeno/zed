@@ -13,14 +13,11 @@ If your repository includes a `.devcontainer/devcontainer.json` file, Zed can op
 
 - Docker or Podman must be installed and available in your `PATH`. If you use `podman`, you must set the `use_podman` setting in your Zed settings.json to true.
 - Your project must contain a `.devcontainer/devcontainer.json` directory/file.
-
-For a project opened in a WSL distribution, the container engine is driven from
-inside that distribution, so `docker` must be on the `PATH` there — for Docker
-Desktop, that means enabling WSL integration for the distribution. Running the
-engine distro-side is what lets the project's ext4 path be used directly as the
-bind mount source, rather than reaching your files through a filesystem bridge.
+- Zed and the Docker or Podman commands run from the project host must select the same container engine. This is automatic for local projects; Docker Desktop's WSL integration is one way to satisfy it for WSL projects.
 
 By default Zed builds dev container images with BuildKit when the `docker buildx` plugin is available. If your Docker-compatible engine lacks an integrated BuildKit (for example, Apple Container accessed through a Docker-API bridge), set `"dev_container_use_buildkit": false` in your settings.json to use the classic Docker builder instead.
+
+For remote projects, Zed creates the container through the project host's CLI, then connects to it through the Zed local CLI. Zed verifies that both CLIs select the same container engine before creation. The container engine must also be able to bind-mount the project's paths. Docker Desktop with WSL integration is a common configuration that satisfies these requirements while keeping the project on WSL's filesystem and avoiding cross-filesystem overhead.
 
 ## Using Dev Containers in Zed
 

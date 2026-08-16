@@ -37,7 +37,6 @@ use ui::{
     NavigableEntry, ParentElement, Render, Styled, StyledExt, Toggleable, Window, div, rems,
 };
 use util::ResultExt;
-use util::paths::PathStyle;
 use util::rel_path::RelPath;
 use workspace::{ModalView, Workspace, with_active_or_new_workspace};
 
@@ -131,7 +130,6 @@ fn container_engine_for_project(
 
 pub struct DevContainerContext {
     pub project_directory: Arc<Path>,
-    pub(crate) project_path_style: PathStyle,
     pub use_podman: bool,
     pub use_buildkit: Option<bool>,
     pub fs: Arc<dyn Fs>,
@@ -153,7 +151,6 @@ impl DevContainerContext {
         let environment = project.environment().downgrade();
         Some(Self {
             project_directory,
-            project_path_style: project.path_style(cx),
             use_podman,
             use_buildkit,
             engine,

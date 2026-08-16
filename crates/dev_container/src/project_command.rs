@@ -1,7 +1,4 @@
 //! Project-local and project-remote command construction.
-//!
-//! Its API follows `remote::RemoteConnection::build_command` so local and
-//! remote projects accept the same command description.
 
 use std::sync::Arc;
 
@@ -40,6 +37,16 @@ impl ProjectCommandBuilder {
         self.connection
             .as_ref()
             .map(|connection| connection.connection_options())
+    }
+
+    /// Starts describing a command to run in the project.
+    pub(crate) fn command(&self, program: impl AsRef<str>) -> ProjectCommand<'_> {
+        ProjectCommand {
+            builder: self,
+            program: program.as_ref().to_string(),
+            args: Vec::new(),
+            environment: HashMap::default(),
+        }
     }
 
     /// Builds the executable command Zed launches for a project command.
@@ -82,5 +89,55 @@ impl ProjectCommandBuilder {
                 Ok(command)
             }
         }
+    }
+}
+
+/// A command described independently of the process used to launch it.
+///
+/// The description owns its program, arguments, and environment so the
+/// project command builder can either launch it locally or delegate it to the
+/// project's remote connection.
+pub(crate) struct ProjectCommand<'a> {
+    builder: &'a ProjectCommandBuilder,
+    program: String,
+    args: Vec<String>,
+    environment: HashMap<String, String>,
+}
+
+impl ProjectCommand<'_> {
+    pub(crate) fn arg(&mut self, argument: impl AsRef<str>) -> &mut Self {
+        self.args.push(argument.as_ref().to_string());
+        self
+    }
+
+    pub(crate) fn args<I, S>(&mut self, arguments: I) -> &mut Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.args.extend(
+            arguments
+                .into_iter()
+                .map(|argument| argument.as_ref().to_string()),
+        );
+        self
+    }
+
+    pub(crate) fn env(&mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> &mut Self {
+        self.environment
+            .insert(key.as_ref().to_string(), value.as_ref().to_string());
+        self
+    }
+
+    /// Builds the executable process command for this project command.
+    pub(crate) fn build(&self) -> Result<Command> {
+        self.builder.build_command(
+            Some(self.program.clone()),
+            &self.args,
+            &self.environment,
+            None,
+            None,
+            Interactive::No,
+        )
     }
 }

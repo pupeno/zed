@@ -8,7 +8,6 @@ use std::{
 use futures::TryFutureExt;
 use gpui::{AsyncWindowContext, Entity};
 use project::Worktree;
-use remote::Interactive;
 use serde::Deserialize;
 use settings::{DevContainerConnection, infer_json_indent_size, replace_value_in_json_text};
 use util::rel_path::RelPath;
@@ -107,9 +106,8 @@ impl Display for DevContainerError {
                 ),
                 DevContainerError::DevContainerScriptsFailed =>
                     "lifecycle scripts could not execute for dev container".to_string(),
-                DevContainerError::DevContainerUpFailed(message) => {
-                    format!("Dev container creation failed: {message}")
-                }
+                DevContainerError::DevContainerUpFailed(_) =>
+                    "DevContainer creation failed".to_string(),
                 DevContainerError::DevContainerTemplateApplyFailed(_) => {
                     "DevContainer template apply failed".to_string()
                 }
@@ -305,8 +303,10 @@ pub async fn start_dev_container_with_config(
             Ok((connection, remote_workspace_folder))
         }
         Err(err @ DevContainerError::MultipleMatchingContainers(_)) => Err(err),
-        Err(err @ DevContainerError::DevContainerUpFailed(_)) => Err(err),
-        Err(err) => Err(DevContainerError::DevContainerUpFailed(format!("{err}"))),
+        Err(err) => {
+            let message = format!("Failed with nested error: {err:?}");
+            Err(DevContainerError::DevContainerUpFailed(message))
+        }
     }
 }
 
@@ -336,21 +336,15 @@ async fn container_engine_identity(
     use_podman: bool,
 ) -> Result<String, DevContainerError> {
     let engine_cli = if use_podman { "podman" } else { "docker" };
-    let args = vec![
-        "info".to_string(),
-        "--format".to_string(),
-        container_engine_identity_format(use_podman).to_string(),
-    ];
+    let identity_format = if use_podman {
+        "{{.Host.Hostname}}:{{.Store.GraphRoot}}:{{.Store.RunRoot}}"
+    } else {
+        "{{.ID}}"
+    };
     let mut command = engine
-        .command_builder
-        .build_command(
-            Some(engine_cli.to_string()),
-            &args,
-            &collections::HashMap::default(),
-            None,
-            None,
-            Interactive::No,
-        )
+        .command(engine_cli)
+        .args(["info", "--format", identity_format])
+        .build()
         .map_err(|error| {
             log::error!("Unable to construct {engine_cli} info command: {error:?}");
             DevContainerError::DockerNotAvailable
@@ -375,14 +369,6 @@ async fn container_engine_identity(
     }
 
     Ok(engine_identity)
-}
-
-fn container_engine_identity_format(use_podman: bool) -> &'static str {
-    if use_podman {
-        "{{.Host.Hostname}}:{{.Store.GraphRoot}}:{{.Store.RunRoot}}"
-    } else {
-        "{{.ID}}"
-    }
 }
 
 pub(crate) async fn apply_devcontainer_template(
@@ -550,9 +536,7 @@ fn get_backup_project_name(remote_workspace_folder: &str, container_id: &str) ->
 mod tests {
     use std::path::PathBuf;
 
-    use crate::devcontainer_api::{
-        DevContainerConfig, DevContainerError, find_configs_in_snapshot,
-    };
+    use crate::devcontainer_api::{DevContainerConfig, find_configs_in_snapshot};
     use fs::FakeFs;
     use gpui::TestAppContext;
     use project::Project;
@@ -565,28 +549,6 @@ mod tests {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
-    }
-
-    #[test]
-    fn dev_container_up_errors_include_the_underlying_failure() {
-        let error = DevContainerError::DevContainerUpFailed(
-            "failed while preparing container build resources: Failed to parse file .devcontainer/devcontainer.json"
-                .to_string(),
-        );
-
-        assert_eq!(
-            error.to_string(),
-            "Dev container creation failed: failed while preparing container build resources: Failed to parse file .devcontainer/devcontainer.json"
-        );
-    }
-
-    #[test]
-    fn container_engine_identity_formats_match_the_cli_info_schema() {
-        assert_eq!(super::container_engine_identity_format(false), "{{.ID}}");
-        assert_eq!(
-            super::container_engine_identity_format(true),
-            "{{.Host.Hostname}}:{{.Store.GraphRoot}}:{{.Store.RunRoot}}"
-        );
     }
 
     #[gpui::test]

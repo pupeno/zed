@@ -1,7 +1,6 @@
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use remote::Interactive;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use util::command::Command;
 
@@ -10,6 +9,7 @@ use crate::{
     container_engine::ContainerEngine,
     devcontainer_api::DevContainerError,
     devcontainer_json::MountDefinition,
+    project_command::ProjectCommand,
 };
 
 #[derive(Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -222,15 +222,9 @@ impl Docker {
             // multi-stage `FROM`.
             use_buildkit
         } else {
-            let args = vec!["buildx".to_string(), "version".to_string()];
-            match engine.command_builder.build_command(
-                Some(docker_cli.to_string()),
-                &args,
-                &collections::HashMap::default(),
-                None,
-                None,
-                Interactive::No,
-            ) {
+            let mut command = engine.command(docker_cli);
+            command.args(["buildx", "version"]);
+            match command.build() {
                 Ok(mut command) => command
                     .output()
                     .await
@@ -258,30 +252,21 @@ impl Docker {
         self.docker_cli == "podman"
     }
 
-    fn command(
-        &self,
-        args: &[String],
-        environment: &collections::HashMap<String, String>,
-    ) -> Result<Command, DevContainerError> {
-        self.engine
-            .command_builder
-            .build_command(
-                Some(self.docker_cli.clone()),
-                args,
-                environment,
-                None,
-                None,
-                Interactive::No,
-            )
-            .map_err(|error| {
-                log::error!("Unable to construct {} command: {error:?}", self.docker_cli);
-                DevContainerError::CommandFailed(self.docker_cli.clone())
-            })
+    fn command(&self) -> ProjectCommand<'_> {
+        self.engine.command(&self.docker_cli)
+    }
+
+    fn build_command(&self, command: ProjectCommand<'_>) -> Result<Command, DevContainerError> {
+        command.build().map_err(|error| {
+            log::error!("Unable to construct {} command: {error:?}", self.docker_cli);
+            DevContainerError::CommandFailed(self.docker_cli.clone())
+        })
     }
 
     async fn pull_image(&self, image: &String) -> Result<(), DevContainerError> {
-        let args = vec!["pull".to_string(), "--".to_string(), image.to_string()];
-        let mut command = self.command(&args, &collections::HashMap::default())?;
+        let mut command = self.command();
+        command.args(["pull", "--", image]);
+        let mut command = self.build_command(command)?;
 
         let output = command.output().await.map_err(|e| {
             log::error!("Error pulling image: {e}");
@@ -300,34 +285,33 @@ impl Docker {
         &self,
         filters: Vec<String>,
     ) -> Result<Command, DevContainerError> {
-        let mut args = vec!["ps".to_string(), "-a".to_string()];
+        let mut command = self.command();
+        command.args(["ps", "-a"]);
 
         for filter in filters {
-            args.extend(["--filter".to_string(), filter]);
+            command.args(["--filter", &filter]);
         }
-        args.push("--format={{ json . }}".to_string());
-        self.command(&args, &collections::HashMap::default())
+        command.arg("--format={{ json . }}");
+        self.build_command(command)
     }
 
     fn create_docker_inspect(&self, id: &str) -> Result<Command, DevContainerError> {
-        let args = vec![
-            "inspect".to_string(),
-            "--format={{json . }}".to_string(),
-            id.to_string(),
-        ];
-        self.command(&args, &collections::HashMap::default())
+        let mut command = self.command();
+        command.args(["inspect", "--format={{json . }}", id]);
+        self.build_command(command)
     }
 
     fn create_docker_compose_config_command(
         &self,
         config_files: &Vec<PathBuf>,
     ) -> Result<Command, DevContainerError> {
-        let mut args = vec!["compose".to_string()];
+        let mut command = self.command();
+        command.arg("compose");
         for file_path in config_files {
-            args.extend(["-f".to_string(), file_path.display().to_string()]);
+            command.args(["-f", &file_path.display().to_string()]);
         }
-        args.push("config".to_string());
-        self.command(&args, &collections::HashMap::default())
+        command.arg("config");
+        self.build_command(command)
     }
 }
 
@@ -367,40 +351,31 @@ impl DockerClient for Docker {
         project_name: &str,
         services: Option<&Vec<String>>,
     ) -> Result<(), DevContainerError> {
-        let mut args = Vec::new();
-        let mut environment = collections::HashMap::default();
+        let mut command = self.command();
         if !self.is_podman() {
             if self.has_buildx {
-                environment.insert("DOCKER_BUILDKIT".to_string(), "1".to_string());
+                command.env("DOCKER_BUILDKIT", "1");
             } else {
                 // Without a usable BuildKit, build through the classic builder so
                 // multi-stage `FROM` of locally-built images (the feature content
                 // image) resolves from the daemon's image store.
-                environment.insert("DOCKER_BUILDKIT".to_string(), "0".to_string());
-                environment.insert("COMPOSE_DOCKER_CLI_BUILD".to_string(), "0".to_string());
+                command.env("DOCKER_BUILDKIT", "0");
+                command.env("COMPOSE_DOCKER_CLI_BUILD", "0");
             }
         }
-        args.extend([
-            "compose".to_string(),
-            "--project-name".to_string(),
-            project_name.to_string(),
-        ]);
+        command.args(["compose", "--project-name", project_name]);
         for docker_compose_file in config_files {
-            args.extend(["-f".to_string(), docker_compose_file.display().to_string()]);
+            command.args(["-f", &docker_compose_file.display().to_string()]);
         }
-        args.push("build".to_string());
+        command.arg("build");
         if let Some(services) = services {
-            args.extend(services.iter().cloned());
+            command.args(services);
         }
 
-        let output = self
-            .command(&args, &environment)?
-            .output()
-            .await
-            .map_err(|e| {
-                log::error!("Error running docker compose up: {e}");
-                DevContainerError::CommandFailed(self.docker_cli.clone())
-            })?;
+        let output = self.build_command(command)?.output().await.map_err(|e| {
+            log::error!("Error running docker compose up: {e}");
+            DevContainerError::CommandFailed(self.docker_cli.clone())
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -418,40 +393,30 @@ impl DockerClient for Docker {
         env: &HashMap<String, String>,
         inner_command: Command,
     ) -> Result<(), DevContainerError> {
-        let mut args = Vec::new();
+        let mut command = self.command();
 
-        args.extend([
-            "exec".to_string(),
-            "-w".to_string(),
-            remote_folder.to_string(),
-            "-u".to_string(),
-            user.to_string(),
-        ]);
+        command.args(["exec", "-w", remote_folder, "-u", user]);
 
         for (k, v) in env.iter() {
             let env_declaration = format!("{}={}", k, v);
-            args.extend(["-e".to_string(), env_declaration]);
+            command.args(["-e", &env_declaration]);
         }
 
-        args.extend([container_id.to_string(), "sh".to_string()]);
+        command.args([container_id, "sh"]);
 
         let mut inner_program_script: Vec<String> =
             vec![inner_command.get_program().display().to_string()];
-        let mut args: Vec<String> = inner_command
+        let mut inner_arguments: Vec<String> = inner_command
             .get_args()
             .map(|arg| arg.display().to_string())
             .collect();
-        inner_program_script.append(&mut args);
-        args.extend(["-c".to_string(), inner_program_script.join(" ")]);
+        inner_program_script.append(&mut inner_arguments);
+        command.args(["-c", &inner_program_script.join(" ")]);
 
-        let output = self
-            .command(&args, &collections::HashMap::default())?
-            .output()
-            .await
-            .map_err(|e| {
-                log::error!("Error running command {e} in container exec");
-                DevContainerError::ContainerNotValid(container_id.to_string())
-            })?;
+        let output = self.build_command(command)?.output().await.map_err(|e| {
+            log::error!("Error running command {e} in container exec");
+            DevContainerError::ContainerNotValid(container_id.to_string())
+        })?;
         let std_out = String::from_utf8_lossy(&output.stdout);
         log::debug!("Command output:\n {std_out}");
         if !output.status.success() {
@@ -463,16 +428,13 @@ impl DockerClient for Docker {
         Ok(())
     }
     async fn start_container(&self, id: &str) -> Result<(), DevContainerError> {
-        let args = vec!["start".to_string(), id.to_string()];
+        let mut command = self.command();
+        command.args(["start", id]);
 
-        let output = self
-            .command(&args, &collections::HashMap::default())?
-            .output()
-            .await
-            .map_err(|e| {
-                log::error!("Error running docker start: {e}");
-                DevContainerError::CommandFailed(self.docker_cli.clone())
-            })?;
+        let output = self.build_command(command)?.output().await.map_err(|e| {
+            log::error!("Error running docker start: {e}");
+            DevContainerError::CommandFailed(self.docker_cli.clone())
+        })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

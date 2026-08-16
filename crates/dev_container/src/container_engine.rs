@@ -4,7 +4,7 @@ use std::sync::Arc;
 use remote::{RemoteConnection, RemoteConnectionOptions};
 use util::paths::PathStyle;
 
-use crate::project_command::ProjectCommandBuilder;
+use crate::project_command::{ProjectCommand, ProjectCommandBuilder};
 
 /// The context used to run commands against a container engine.
 ///
@@ -55,6 +55,49 @@ impl ContainerEngine {
         self.command_builder.connection_options().is_some()
     }
 
+    pub(crate) fn command(&self, program: impl AsRef<str>) -> ProjectCommand<'_> {
+        self.command_builder.command(program)
+    }
+
+    pub(crate) fn join_path(&self, base: &Path, path: impl AsRef<Path>) -> PathBuf {
+        let path = path.as_ref();
+        if self.path_style.is_posix() {
+            let path_string = path.to_string_lossy();
+            if self.path_style.is_absolute(&path_string) {
+                return PathBuf::from(self.path_style.normalize(&path_string));
+            }
+
+            let base_string = base.to_string_lossy();
+            let separator = if base_string.ends_with(self.path_style.primary_separator()) {
+                ""
+            } else {
+                self.path_style.primary_separator()
+            };
+            PathBuf::from(
+                self.path_style
+                    .normalize(&format!("{base_string}{separator}{path_string}")),
+            )
+        } else {
+            base.join(path)
+        }
+    }
+
+    pub(crate) fn normalize_path(&self, path: &Path) -> PathBuf {
+        if self.path_style.is_posix() {
+            PathBuf::from(self.path_style.normalize(&path.to_string_lossy()))
+        } else {
+            util::normalize_path(path)
+        }
+    }
+
+    pub(crate) fn temporary_directory(&self) -> PathBuf {
+        if self.path_style.is_posix() {
+            PathBuf::from("/tmp/devcontainer-zed")
+        } else {
+            std::env::temp_dir().join("devcontainer-zed")
+        }
+    }
+
     pub(crate) fn filesystem_path(&self, path: &Path) -> PathBuf {
         let Some(distro_name) = &self.wsl_distro_name else {
             return path.to_path_buf();
@@ -79,6 +122,10 @@ impl ContainerEngine {
     pub(crate) fn is_posix(&self) -> bool {
         self.path_style == PathStyle::Unix
     }
+
+    pub(crate) fn path_style(&self) -> PathStyle {
+        self.path_style
+    }
 }
 
 #[cfg(windows)]
@@ -93,8 +140,6 @@ fn wsl_filesystem_path(path: &Path, distro_name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use collections::HashMap;
-    use remote::Interactive;
     use util::command::Command;
 
     fn rendered(command: &Command) -> Vec<String> {
@@ -106,22 +151,12 @@ mod tests {
 
     #[test]
     fn local_engine_runs_the_program_directly() {
-        let args = vec!["ps".to_string(), "-a".to_string()];
+        let engine = ContainerEngine::local();
+        let mut command = engine.command("docker");
+        command.args(["ps", "-a"]);
 
         assert_eq!(
-            rendered(
-                &ContainerEngine::local()
-                    .command_builder
-                    .build_command(
-                        Some("docker".to_string()),
-                        &args,
-                        &HashMap::default(),
-                        None,
-                        None,
-                        Interactive::No,
-                    )
-                    .expect("command builds")
-            ),
+            rendered(&command.build().expect("command builds")),
             ["docker", "ps", "-a"]
         );
     }

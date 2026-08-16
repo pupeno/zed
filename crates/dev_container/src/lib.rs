@@ -43,8 +43,8 @@ use workspace::{ModalView, Workspace, with_active_or_new_workspace};
 
 use http_client::HttpClient;
 
-mod command_host;
 mod command_json;
+mod container_engine;
 mod devcontainer_api;
 mod devcontainer_json;
 mod devcontainer_manifest;
@@ -107,23 +107,24 @@ pub fn unsupported_reason(project: &project::Project, cx: &App) -> Option<&'stat
         return Some("Cannot open Dev Container from a shared project");
     }
 
-    if command_host_for_project(project, cx).is_none() {
+    if container_engine_for_project(project, cx).is_none() {
         return Some("Cannot open Dev Container from this remote project");
     }
 
     None
 }
 
-fn command_host_for_project(
+fn container_engine_for_project(
     project: &project::Project,
     cx: &App,
-) -> Option<Arc<dyn command_host::CommandHost>> {
+) -> Option<Arc<container_engine::ContainerEngine>> {
     match project.remote_client() {
         Some(client) => client
             .read(cx)
             .remote_connection()
-            .map(command_host::host_for_remote_connection),
-        None => Some(Arc::new(command_host::LocalCommandHost)),
+            .map(container_engine::ContainerEngine::for_remote_connection)
+            .map(Arc::new),
+        None => Some(Arc::new(container_engine::ContainerEngine::local())),
     }
 }
 
@@ -135,14 +136,14 @@ pub struct DevContainerContext {
     pub fs: Arc<dyn Fs>,
     pub http_client: Arc<dyn HttpClient>,
     pub environment: WeakEntity<ProjectEnvironment>,
-    pub(crate) host: Arc<dyn command_host::CommandHost>,
+    pub(crate) engine: Arc<container_engine::ContainerEngine>,
 }
 
 impl DevContainerContext {
     pub fn from_workspace(workspace: &Workspace, cx: &App) -> Option<Self> {
         let project = workspace.project().read(cx);
         let project_directory = project.active_project_directory(cx)?;
-        let host = command_host_for_project(project, cx)?;
+        let engine = container_engine_for_project(project, cx)?;
         let settings = DevContainerSettings::get_global(cx);
         let use_podman = settings.use_podman;
         let use_buildkit = settings.use_buildkit;
@@ -154,7 +155,7 @@ impl DevContainerContext {
             project_path_style: project.path_style(cx),
             use_podman,
             use_buildkit,
-            host,
+            engine,
             fs,
             http_client,
             environment,

@@ -14,8 +14,8 @@ use util::{ResultExt, command::Command, normalize_path, paths::PathStyle};
 
 use crate::{
     DevContainerConfig, DevContainerContext,
-    command_host::{CommandHost, CommandSpec},
     command_json::{CommandRunner, DefaultCommandRunner},
+    container_engine::{CommandSpec, ContainerEngine},
     devcontainer_api::{DevContainerError, DevContainerUp},
     devcontainer_json::{
         ContainerBuild, DevContainer, DevContainerBuildType, FeatureOptions, ForwardPort,
@@ -53,9 +53,7 @@ struct DevContainerManifest {
     fs: Arc<dyn Fs>,
     docker_client: Arc<dyn DockerClient>,
     command_runner: Arc<dyn CommandRunner>,
-    /// The machine the container engine runs on, which is not necessarily the
-    /// one running Zed.
-    host: Arc<dyn CommandHost>,
+    engine: Arc<ContainerEngine>,
     raw_config: String,
     config: ConfigStatus,
     local_environment: HashMap<String, String>,
@@ -85,7 +83,7 @@ impl DevContainerManifest {
         log::debug!("parsing devcontainer json found in {:?}", &config_path);
         let devcontainer_contents = context
             .fs
-            .load(&context.host.filesystem_path(&config_path))
+            .load(&context.engine.filesystem_path(&config_path))
             .await
             .map_err(|e| {
                 log::error!("Unable to read devcontainer contents: {e}");
@@ -111,7 +109,7 @@ impl DevContainerManifest {
             http_client: context.http_client.clone(),
             docker_client,
             command_runner,
-            host: context.host.clone(),
+            engine: context.engine.clone(),
             raw_config: devcontainer_contents,
             config: ConfigStatus::Deserialized(devcontainer),
             local_project_directory: local_project_path.to_path_buf(),
@@ -147,15 +145,15 @@ impl DevContainerManifest {
     }
 
     fn fs_path(&self, path: &Path) -> PathBuf {
-        self.host.filesystem_path(path)
+        self.engine.filesystem_path(path)
     }
 
     fn temporary_directory(&self) -> PathBuf {
         project_temporary_directory(self.project_path_style)
     }
 
-    fn host_command(&self, spec: CommandSpec) -> Result<Command, DevContainerError> {
-        self.host.command(spec).map_err(|error| {
+    fn engine_command(&self, spec: CommandSpec) -> Result<Command, DevContainerError> {
+        self.engine.command(spec).map_err(|error| {
             log::error!("Failed to construct command for the container engine: {error:?}");
             DevContainerError::CommandFailed(self.docker_client.docker_cli())
         })
@@ -173,7 +171,7 @@ impl DevContainerManifest {
         spec.arg(flag);
         let label = format!("id {flag}");
 
-        let output = self.host_command(spec)?.output().await.map_err(|e| {
+        let output = self.engine_command(spec)?.output().await.map_err(|e| {
             log::error!("Failed to get host id ({flag}): {e}");
             DevContainerError::CommandFailed(label.clone())
         })?;
@@ -188,7 +186,7 @@ impl DevContainerManifest {
     }
 
     fn identifying_labels(&self) -> Vec<(&str, String)> {
-        let posix_host = self.host.is_posix();
+        let posix_host = self.engine.is_posix();
         let labels = vec![
             (
                 "devcontainer.local_folder",
@@ -803,7 +801,7 @@ impl DevContainerManifest {
         use_buildkit: bool,
     ) -> String {
         let update_remote_user_uid =
-            self.host.is_posix() && self.dev_container().update_remote_user_uid.unwrap_or(true);
+            self.engine.is_posix() && self.dev_container().update_remote_user_uid.unwrap_or(true);
         let feature_layers: String = self
             .features
             .iter()
@@ -1747,7 +1745,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
     ) -> Result<bool, DevContainerError> {
         // UID remapping requires POSIX ownership semantics on the engine host;
         // Windows filesystem paths have no uid to match.
-        if !self.host.is_posix() {
+        if !self.engine.is_posix() {
             return Ok(false);
         }
         if self.features_build_info.is_none() {
@@ -1823,7 +1821,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
         spec.args(["--build-arg", &format!("IMAGE_USER={}", image_user)]);
         spec.arg(features_build_info.empty_context_dir.display().to_string());
 
-        let mut command = self.host_command(spec)?;
+        let mut command = self.engine_command(spec)?;
         let output = self
             .command_runner
             .run_command(&mut command)
@@ -1935,7 +1933,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             &features_content_dir.display().to_string(),
         ]);
 
-        let mut command = self.host_command(spec)?;
+        let mut command = self.engine_command(spec)?;
         let output = self
             .command_runner
             .run_command(&mut command)
@@ -2062,7 +2060,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             spec.arg(features_build_info.empty_context_dir.display().to_string());
         }
 
-        self.host_command(spec)
+        self.engine_command(spec)
     }
 
     async fn run_docker_compose(
@@ -2108,7 +2106,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             spec.args(services);
         }
 
-        let mut command = self.host_command(spec)?;
+        let mut command = self.engine_command(spec)?;
         let output = self
             .command_runner
             .run_command(&mut command)
@@ -2350,7 +2348,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             spec.arg(&build_resources.image_tag);
         }
 
-        self.host_command(spec)
+        self.engine_command(spec)
     }
 
     fn extension_ids(&self) -> Vec<String> {
@@ -2774,9 +2772,9 @@ pub(crate) async fn read_devcontainer_configuration(
     environment: HashMap<String, String>,
 ) -> Result<DevContainer, DevContainerError> {
     let docker = if context.use_podman {
-        Docker::new(context.host.clone(), "podman", context.use_buildkit).await
+        Docker::new(context.engine.clone(), "podman", context.use_buildkit).await
     } else {
-        Docker::new(context.host.clone(), "docker", context.use_buildkit).await
+        Docker::new(context.engine.clone(), "docker", context.use_buildkit).await
     };
     let mut dev_container = DevContainerManifest::new(
         context,
@@ -2798,9 +2796,9 @@ pub(crate) async fn spawn_dev_container(
     local_project_path: &Path,
 ) -> Result<DevContainerUp, DevContainerError> {
     let docker = if context.use_podman {
-        Docker::new(context.host.clone(), "podman", context.use_buildkit).await
+        Docker::new(context.engine.clone(), "podman", context.use_buildkit).await
     } else {
-        Docker::new(context.host.clone(), "docker", context.use_buildkit).await
+        Docker::new(context.engine.clone(), "docker", context.use_buildkit).await
     };
     let mut devcontainer_manifest = DevContainerManifest::new(
         context,
@@ -3640,7 +3638,7 @@ mod test {
         },
         oci::TokenResponse,
     };
-    /// Tests drive a `LocalCommandHost`, so its POSIX setting follows the build
+    /// Tests drive a local container engine, so its POSIX setting follows the build
     /// target.
     const POSIX_TEST_HOST: bool = cfg!(not(target_os = "windows"));
 
@@ -3754,7 +3752,7 @@ mod test {
             fs: fs.clone(),
             http_client: http_client.clone(),
             environment: project_environment.downgrade(),
-            host: Arc::new(crate::command_host::LocalCommandHost),
+            engine: Arc::new(crate::container_engine::ContainerEngine::local()),
         };
 
         let test_dependencies = TestDependencies {

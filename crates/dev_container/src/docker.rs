@@ -5,8 +5,8 @@ use serde::{Deserialize, Deserializer, Serialize, de};
 use util::command::Command;
 
 use crate::{
-    command_host::{CommandHost, CommandSpec},
     command_json::{evaluate_json_command, evaluate_yaml_command},
+    container_engine::{CommandSpec, ContainerEngine},
     devcontainer_api::DevContainerError,
     devcontainer_json::MountDefinition,
 };
@@ -192,7 +192,7 @@ pub(crate) struct DockerComposeConfig {
 }
 
 pub(crate) struct Docker {
-    host: Arc<dyn CommandHost>,
+    engine: Arc<ContainerEngine>,
     docker_cli: String,
     has_buildx: bool,
 }
@@ -205,7 +205,7 @@ impl DockerInspect {
 
 impl Docker {
     pub(crate) async fn new(
-        host: Arc<dyn CommandHost>,
+        engine: Arc<ContainerEngine>,
         docker_cli: &str,
         use_buildkit: Option<bool>,
     ) -> Self {
@@ -223,7 +223,7 @@ impl Docker {
         } else {
             let mut spec = CommandSpec::new(docker_cli);
             spec.args(["buildx", "version"]);
-            match host.command(spec) {
+            match engine.command(spec) {
                 Ok(mut command) => command
                     .output()
                     .await
@@ -241,7 +241,7 @@ impl Docker {
             );
         }
         Self {
-            host,
+            engine,
             docker_cli: docker_cli.to_string(),
             has_buildx,
         }
@@ -258,7 +258,7 @@ impl Docker {
     }
 
     fn command(&self, spec: CommandSpec) -> Result<Command, DevContainerError> {
-        self.host.command(spec).map_err(|error| {
+        self.engine.command(spec).map_err(|error| {
             log::error!("Unable to construct {} command: {error:?}", self.docker_cli);
             DevContainerError::CommandFailed(self.docker_cli.clone())
         })
@@ -808,7 +808,7 @@ mod test {
         // `Some(_)` short-circuits the `buildx version` probe, so these run
         // without invoking docker.
         let forced_off = futures::executor::block_on(Docker::new(
-            Arc::new(crate::command_host::LocalCommandHost),
+            Arc::new(crate::container_engine::ContainerEngine::local()),
             "docker",
             Some(false),
         ));
@@ -818,7 +818,7 @@ mod test {
         );
 
         let forced_on = futures::executor::block_on(Docker::new(
-            Arc::new(crate::command_host::LocalCommandHost),
+            Arc::new(crate::container_engine::ContainerEngine::local()),
             "docker",
             Some(true),
         ));
@@ -829,7 +829,7 @@ mod test {
 
         // podman never supports the BuildKit/buildx path, regardless of the setting.
         let podman = futures::executor::block_on(Docker::new(
-            Arc::new(crate::command_host::LocalCommandHost),
+            Arc::new(crate::container_engine::ContainerEngine::local()),
             "podman",
             Some(true),
         ));
@@ -917,7 +917,7 @@ mod test {
     #[test]
     fn should_create_docker_inspect_command() {
         let docker = Docker {
-            host: Arc::new(crate::command_host::LocalCommandHost),
+            engine: Arc::new(crate::container_engine::ContainerEngine::local()),
             docker_cli: "docker".to_string(),
             has_buildx: false,
         };
@@ -941,7 +941,7 @@ mod test {
     #[test]
     fn docker_exec_returns_error_on_nonzero_exit() {
         let docker = Docker {
-            host: Arc::new(crate::command_host::LocalCommandHost),
+            engine: Arc::new(crate::container_engine::ContainerEngine::local()),
             docker_cli: "false".to_string(),
             has_buildx: false,
         };

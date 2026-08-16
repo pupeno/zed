@@ -17,7 +17,7 @@ use worktree::Snapshot;
 
 use crate::{
     DevContainerContext, DevContainerFeature, DevContainerTemplate,
-    command_host::CommandSpec,
+    container_engine::CommandSpec,
     devcontainer_json::DevContainer,
     devcontainer_manifest::{read_devcontainer_configuration, spawn_dev_container},
     devcontainer_templates_repository, get_latest_oci_manifest, get_oci_token, ghcr_registry,
@@ -311,12 +311,12 @@ pub async fn start_dev_container_with_config(
 
 async fn check_for_docker(context: &DevContainerContext) -> Result<(), DevContainerError> {
     let engine_identity =
-        container_engine_identity(context.host.as_ref(), context.use_podman).await?;
+        container_engine_identity(context.engine.as_ref(), context.use_podman).await?;
 
-    if context.host.requires_local_engine_match_verification() {
-        let local_host = crate::command_host::LocalCommandHost;
+    if context.engine.requires_local_engine_match_verification() {
+        let local_engine = crate::container_engine::ContainerEngine::local();
         let local_engine_identity =
-            container_engine_identity(&local_host, context.use_podman).await?;
+            container_engine_identity(&local_engine, context.use_podman).await?;
         if engine_identity != local_engine_identity {
             log::error!(
                 "The container engine ({engine_identity}) differs from the local container engine ({local_engine_identity})"
@@ -337,7 +337,7 @@ fn container_engine_identity_format(use_podman: bool) -> &'static str {
 }
 
 async fn container_engine_identity(
-    host: &dyn crate::command_host::CommandHost,
+    engine: &crate::container_engine::ContainerEngine,
     use_podman: bool,
 ) -> Result<String, DevContainerError> {
     let engine_cli = if use_podman { "podman" } else { "docker" };
@@ -347,7 +347,7 @@ async fn container_engine_identity(
         "--format",
         container_engine_identity_format(use_podman),
     ]);
-    let mut command = host.command(spec).map_err(|error| {
+    let mut command = engine.command(spec).map_err(|error| {
         log::error!("Unable to construct {engine_cli} info command: {error:?}");
         DevContainerError::DockerNotAvailable
     })?;

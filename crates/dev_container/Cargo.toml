@@ -25,6 +25,7 @@ paths.workspace = true
 regex.workspace = true
 picker.workspace = true
 project.workspace = true
+remote.workspace = true
 settings.workspace = true
 ui.workspace = true
 util.workspace = true

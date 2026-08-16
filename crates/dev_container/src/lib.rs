@@ -9,6 +9,7 @@ use http_client::anyhow;
 use picker::Picker;
 use picker::PickerDelegate;
 use project::ProjectEnvironment;
+use remote::ProjectHost;
 use settings::RegisterSetting;
 use settings::Settings;
 use std::collections::HashMap;
@@ -97,6 +98,7 @@ fn get_safe_id(input: &str) -> String {
 
 pub struct DevContainerContext {
     pub project_directory: Arc<Path>,
+    pub project_host: Arc<ProjectHost>,
     pub use_podman: bool,
     pub use_buildkit: Option<bool>,
     pub fs: Arc<dyn Fs>,
@@ -106,7 +108,22 @@ pub struct DevContainerContext {
 
 impl DevContainerContext {
     pub fn from_workspace(workspace: &Workspace, cx: &App) -> Option<Self> {
-        let project_directory = workspace.project().read(cx).active_project_directory(cx)?;
+        let project = workspace.project();
+        let project_directory = project.read(cx).active_project_directory(cx)?;
+        let project_host = if let Some(remote_client) = project.read(cx).remote_client() {
+            match ProjectHost::from_remote_client(project_directory.clone(), remote_client.read(cx))
+            {
+                Ok(project_host) => Arc::new(project_host),
+                Err(error) => {
+                    log::error!("failed to construct project host for Dev Containers: {error:#}");
+                    return None;
+                }
+            }
+        } else if project.read(cx).is_local() {
+            Arc::new(ProjectHost::local(project_directory.clone()))
+        } else {
+            return None;
+        };
         let settings = DevContainerSettings::get_global(cx);
         let use_podman = settings.use_podman;
         let use_buildkit = settings.use_buildkit;
@@ -115,6 +132,7 @@ impl DevContainerContext {
         let environment = workspace.project().read(cx).environment().downgrade();
         Some(Self {
             project_directory,
+            project_host,
             use_podman,
             use_buildkit,
             fs,

@@ -97,11 +97,11 @@ enum DevContainerCreationProgress {
     Error(String),
 }
 
-#[derive(Clone)]
 struct CreateRemoteDevContainer {
     view_logs_entry: NavigableEntry,
     back_entry: NavigableEntry,
     progress: DevContainerCreationProgress,
+    _creating: Option<Task<()>>,
 }
 
 impl CreateRemoteDevContainer {
@@ -112,6 +112,7 @@ impl CreateRemoteDevContainer {
             view_logs_entry,
             back_entry,
             progress,
+            _creating: None,
         }
     }
 }
@@ -271,7 +272,6 @@ impl PickerDelegate for DevContainerPickerDelegate {
                     .flatten()
                 {
                     modal.open_dev_container(selected_config, app_state, context, window, cx);
-                    modal.view_in_progress_dev_container(window, cx);
                 } else {
                     log::error!("No active project directory for Dev Container");
                 }
@@ -1458,7 +1458,6 @@ impl RemoteServerProjects {
         } else if let Some(context) = dev_container_context {
             let config = configs.into_iter().next();
             this.open_dev_container(config, app_state, context, window, cx);
-            this.view_in_progress_dev_container(window, cx);
         } else {
             log::error!("No active project directory for Dev Container");
         }
@@ -1766,12 +1765,16 @@ impl RemoteServerProjects {
         cx.notify();
     }
 
-    fn view_in_progress_dev_container(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn view_in_progress_dev_container(
+        &mut self,
+        creating: Task<()>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         self.allow_dismissal = false;
-        self.mode = Mode::CreateRemoteDevContainer(CreateRemoteDevContainer::new(
-            DevContainerCreationProgress::Creating,
-            cx,
-        ));
+        let mut state = CreateRemoteDevContainer::new(DevContainerCreationProgress::Creating, cx);
+        state._creating = Some(creating);
+        self.mode = Mode::CreateRemoteDevContainer(state);
         self.focus_handle(cx).focus(window, cx);
         cx.notify();
     }
@@ -2229,14 +2232,13 @@ impl RemoteServerProjects {
         {
             let config = configs.into_iter().next();
             self.open_dev_container(config, app_state, context, window, cx);
-            self.view_in_progress_dev_container(window, cx);
         } else {
             log::error!("No active project directory for Dev Container");
         }
     }
 
     fn open_dev_container(
-        &self,
+        &mut self,
         config: Option<DevContainerConfig>,
         app_state: Arc<AppState>,
         context: DevContainerContext,
@@ -2246,7 +2248,7 @@ impl RemoteServerProjects {
         let replace_window = window.window_handle().downcast::<MultiWorkspace>();
         let app_state = Arc::downgrade(&app_state);
 
-        cx.spawn_in(window, async move |entity, cx| {
+        let creating = cx.spawn_in(window, async move |entity, cx| {
             let environment = context.environment(cx).await;
 
             let (dev_container_connection, starting_dir) =
@@ -2286,13 +2288,6 @@ impl RemoteServerProjects {
             })
             .log_err();
 
-            entity
-                .update(cx, |this, cx| {
-                    this.allow_dismissal = true;
-                    cx.emit(DismissEvent);
-                })
-                .log_err();
-
             let Some(app_state) = app_state.upgrade() else {
                 return;
             };
@@ -2318,8 +2313,14 @@ impl RemoteServerProjects {
                 .await
                 .ok();
             }
-        })
-        .detach();
+            entity
+                .update(cx, |this, cx| {
+                    this.allow_dismissal = true;
+                    cx.emit(DismissEvent);
+                })
+                .log_err();
+        });
+        self.view_in_progress_dev_container(creating, window, cx);
     }
 
     fn render_create_dev_container(
@@ -3154,9 +3155,10 @@ mod filter_tests {
 }
 
 #[cfg(test)]
-mod create_host_tests {
+mod remote_server_projects_tests {
     use super::*;
     use gpui::TestAppContext;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn init_test(cx: &mut TestAppContext) -> Arc<AppState> {
         cx.update(|cx| {
@@ -3218,5 +3220,45 @@ mod create_host_tests {
 
         assert_eq!(connections[0].projects.len(), 1);
         assert!(connections[new_index.0].projects.is_empty());
+    }
+
+    #[gpui::test]
+    async fn cancelling_dev_container_creation_drops_the_pending_startup_task(
+        cx: &mut TestAppContext,
+    ) {
+        struct StartupTaskDropGuard(Arc<AtomicBool>);
+
+        impl Drop for StartupTaskDropGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let app_state = init_test(cx);
+        let fs: Arc<dyn Fs> = app_state.fs.clone();
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let modal = workspace.update_in(cx, |_workspace, window, cx| {
+            let workspace = cx.weak_entity();
+            cx.new(|cx| RemoteServerProjects::new(false, fs.clone(), window, workspace, cx))
+        });
+        let startup_task_dropped = Arc::new(AtomicBool::new(false));
+
+        modal.update_in(cx, |modal, window, cx| {
+            let drop_guard = StartupTaskDropGuard(startup_task_dropped.clone());
+            let creating = cx.spawn(async move |_, _| {
+                let _drop_guard = drop_guard;
+                futures::future::pending::<()>().await;
+            });
+            modal.view_in_progress_dev_container(creating, window, cx);
+            modal.cancel(&menu::Cancel, window, cx);
+        });
+
+        cx.run_until_parked();
+        assert!(
+            startup_task_dropped.load(Ordering::SeqCst),
+            "cancelling Dev Container creation must cancel the pending startup task"
+        );
     }
 }

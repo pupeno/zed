@@ -52,6 +52,15 @@ impl DevContainerConfig {
     }
 }
 
+pub fn is_supported_dev_container_source_connection(
+    connection: &remote::RemoteConnectionOptions,
+) -> bool {
+    matches!(
+        connection,
+        remote::RemoteConnectionOptions::Ssh(_) | remote::RemoteConnectionOptions::Wsl(_)
+    )
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DevContainerUp {
@@ -523,12 +532,17 @@ mod tests {
     use crate::{
         devcontainer_api::{
             DevContainerConfig, DevContainerError, check_for_docker, find_configs_in_snapshot,
+            is_supported_dev_container_source_connection,
         },
         project_host::test_support::RecordingProjectHost,
     };
     use fs::FakeFs;
     use gpui::TestAppContext;
     use project::Project;
+    use remote::{
+        DockerConnectionOptions, HostDockerConnectionOptions, ProjectHostConnectionOptions,
+        RemoteConnectionOptions, SshConnectionOptions, WslConnectionOptions,
+    };
     use serde_json::json;
     use settings::SettingsStore;
     use util::path;
@@ -548,6 +562,36 @@ mod tests {
             "/host/tmp",
             FakeFs::new(cx.executor()),
         ))
+    }
+
+    #[test]
+    fn ssh_and_wsl_are_supported_dev_container_source_connections() {
+        assert!(is_supported_dev_container_source_connection(
+            &RemoteConnectionOptions::Ssh(SshConnectionOptions::default())
+        ));
+        assert!(is_supported_dev_container_source_connection(
+            &RemoteConnectionOptions::Wsl(WslConnectionOptions {
+                distro_name: "Ubuntu".to_string(),
+                user: None,
+            })
+        ));
+        assert!(!is_supported_dev_container_source_connection(
+            &RemoteConnectionOptions::Docker(DockerConnectionOptions::default())
+        ));
+        assert!(!is_supported_dev_container_source_connection(
+            &RemoteConnectionOptions::Docker(DockerConnectionOptions {
+                use_podman: true,
+                ..Default::default()
+            })
+        ));
+        assert!(!is_supported_dev_container_source_connection(
+            &RemoteConnectionOptions::HostDocker(HostDockerConnectionOptions {
+                project_host: ProjectHostConnectionOptions::Ssh(SshConnectionOptions::default()),
+                project_root: PathBuf::from("/project"),
+                devcontainer_config: PathBuf::from("/project/.devcontainer/devcontainer.json"),
+                container: DockerConnectionOptions::default(),
+            })
+        ));
     }
 
     #[gpui::test]

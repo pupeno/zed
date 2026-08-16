@@ -38,7 +38,9 @@ pub use remote_servers::RemoteServerProjects;
 use settings::{DefaultOpenBehavior, Settings, WorktreeId};
 use workspace::ProjectGroupKey;
 
-use dev_container::{DevContainerContext, find_devcontainer_configs};
+use dev_container::{
+    DevContainerContext, find_devcontainer_configs, is_supported_dev_container_source_connection,
+};
 use ui::{
     ButtonLike, ContextMenu, Divider, HighlightedLabel, KeyBinding, ListItem, ListItemSpacing,
     ListSubHeader, PopoverMenu, PopoverMenuHandle, TintColor, Tooltip, prelude::*,
@@ -505,12 +507,21 @@ pub fn init(cx: &mut App) {
 
     cx.on_action(|_: &OpenDevContainer, cx| {
         with_active_or_new_workspace(cx, move |workspace, window, cx| {
-            if !workspace.project().read(cx).is_local() {
+            let supported_source = {
+                let project = workspace.project();
+                let project = project.read(cx);
+                project.is_local()
+                    || project
+                        .remote_connection_options(cx)
+                        .as_ref()
+                        .is_some_and(is_supported_dev_container_source_connection)
+            };
+            if !supported_source {
                 cx.spawn_in(window, async move |_, cx| {
                     cx.prompt(
                         gpui::PromptLevel::Critical,
-                        "Cannot open Dev Container from remote project",
-                        None,
+                        "Cannot open Dev Container from this project",
+                        Some("Open the original local, SSH, or WSL project instead."),
                         &["OK"],
                     )
                     .await

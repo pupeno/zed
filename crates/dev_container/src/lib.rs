@@ -65,7 +65,7 @@ use crate::project_host::{ProjectHostCapability, RemoteProjectHost};
 
 pub use devcontainer_api::{
     DevContainerConfig, find_configs_in_snapshot, find_devcontainer_configs,
-    start_dev_container_with_config,
+    is_supported_dev_container_source_connection, start_dev_container_with_config,
 };
 
 /// Converts a string to a safe environment variable name.

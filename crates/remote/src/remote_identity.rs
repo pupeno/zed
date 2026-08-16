@@ -22,6 +22,14 @@ pub enum RemoteConnectionIdentity {
         name: String,
         remote_user: String,
     },
+    HostDocker {
+        project_host: Box<RemoteConnectionIdentity>,
+        project_root: String,
+        devcontainer_config: String,
+        container_id: String,
+        name: String,
+        remote_user: String,
+    },
     #[cfg(any(test, feature = "test-support"))]
     Mock { id: u64 },
 }
@@ -51,6 +59,17 @@ impl RemoteConnectionIdentity {
                 name,
                 remote_user,
             } => format!("docker:{remote_user}@{name}:{container_id}"),
+            Self::HostDocker {
+                project_host,
+                project_root,
+                devcontainer_config,
+                container_id,
+                name,
+                remote_user,
+            } => format!(
+                "host-docker:{}:{project_root}:{devcontainer_config}:{remote_user}@{name}:{container_id}",
+                project_host.persistence_key()
+            ),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock { id } => format!("mock:{id}"),
         }
@@ -73,6 +92,16 @@ impl From<&RemoteConnectionOptions> for RemoteConnectionIdentity {
                 container_id: options.container_id.clone(),
                 name: options.name.clone(),
                 remote_user: options.remote_user.clone(),
+            },
+            RemoteConnectionOptions::HostDocker(options) => Self::HostDocker {
+                project_host: Box::new(RemoteConnectionIdentity::from(
+                    &options.project_host.remote_connection_options(),
+                )),
+                project_root: options.project_root.display().to_string(),
+                devcontainer_config: options.devcontainer_config.display().to_string(),
+                container_id: options.container.container_id.clone(),
+                name: options.container.name.clone(),
+                remote_user: options.container.remote_user.clone(),
             },
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(options) => Self::Mock { id: options.id },
@@ -102,7 +131,10 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
-    use crate::{DockerConnectionOptions, SshConnectionOptions, WslConnectionOptions};
+    use crate::{
+        DockerConnectionOptions, HostDockerConnectionOptions, ProjectHostConnectionOptions,
+        SshConnectionOptions, WslConnectionOptions,
+    };
 
     #[test]
     fn ssh_identity_ignores_non_persisted_runtime_fields() {
@@ -184,6 +216,83 @@ mod tests {
         });
 
         assert!(same_remote_connection_identity(Some(&left), Some(&right),));
+    }
+
+    #[test]
+    fn host_backed_container_identity_includes_the_project_host_and_transition() {
+        let container = DockerConnectionOptions {
+            name: "zed-dev".to_string(),
+            container_id: "container-123".to_string(),
+            remote_user: "anth".to_string(),
+            ..Default::default()
+        };
+        let left = RemoteConnectionOptions::HostDocker(HostDockerConnectionOptions {
+            project_host: ProjectHostConnectionOptions::Ssh(SshConnectionOptions {
+                host: "example.com".into(),
+                username: Some("anth".to_string()),
+                port: Some(2222),
+                ..Default::default()
+            }),
+            project_root: "/work/project".into(),
+            devcontainer_config: "/work/project/.devcontainer/devcontainer.json".into(),
+            container: container.clone(),
+        });
+        let right = RemoteConnectionOptions::HostDocker(HostDockerConnectionOptions {
+            project_host: ProjectHostConnectionOptions::Ssh(SshConnectionOptions {
+                host: "example.com".into(),
+                username: Some("anth".to_string()),
+                port: Some(2222),
+                ..Default::default()
+            }),
+            project_root: "/work/project".into(),
+            devcontainer_config: "/work/project/.devcontainer/devcontainer.json".into(),
+            container,
+        });
+
+        assert!(same_remote_connection_identity(Some(&left), Some(&right)));
+
+        let different_host = RemoteConnectionOptions::HostDocker(HostDockerConnectionOptions {
+            project_host: ProjectHostConnectionOptions::Ssh(SshConnectionOptions {
+                host: "other.example.com".into(),
+                username: Some("anth".to_string()),
+                port: Some(2222),
+                ..Default::default()
+            }),
+            project_root: "/work/project".into(),
+            devcontainer_config: "/work/project/.devcontainer/devcontainer.json".into(),
+            container: DockerConnectionOptions {
+                name: "zed-dev".to_string(),
+                container_id: "container-123".to_string(),
+                remote_user: "anth".to_string(),
+                ..Default::default()
+            },
+        });
+        let different_transition =
+            RemoteConnectionOptions::HostDocker(HostDockerConnectionOptions {
+                project_host: ProjectHostConnectionOptions::Ssh(SshConnectionOptions {
+                    host: "example.com".into(),
+                    username: Some("anth".to_string()),
+                    port: Some(2222),
+                    ..Default::default()
+                }),
+                project_root: "/work/other-project".into(),
+                devcontainer_config: "/work/other-project/.devcontainer/devcontainer.json".into(),
+                container: DockerConnectionOptions {
+                    name: "zed-dev".to_string(),
+                    container_id: "container-123".to_string(),
+                    remote_user: "anth".to_string(),
+                    ..Default::default()
+                },
+            });
+
+        assert!(!same_remote_connection_identity(
+            Some(&left),
+            Some(&different_host)
+        ));
+        assert!(!same_remote_connection_identity(
+            Some(&left),
+            Some(&different_transition)
+        ));
     }
 
     #[test]

@@ -9,7 +9,10 @@ use futures::TryFutureExt;
 use gpui::{AsyncWindowContext, Entity};
 use project::Worktree;
 use serde::Deserialize;
-use settings::{DevContainerConnection, infer_json_indent_size, replace_value_in_json_text};
+use settings::{
+    DevContainerConnection, DevContainerProjectHost, infer_json_indent_size,
+    replace_value_in_json_text,
+};
 use util::rel_path::RelPath;
 use walkdir::WalkDir;
 use workspace::Workspace;
@@ -263,6 +266,24 @@ pub async fn start_dev_container_with_config(
     let Some(actual_config) = config.clone() else {
         return Err(DevContainerError::NotInValidProject);
     };
+    let project_host = context
+        .project_host
+        .remote_connection_options()
+        .and_then(|connection| match connection {
+            remote::RemoteConnectionOptions::Ssh(options) => Some(DevContainerProjectHost::Ssh {
+                host: options.host.to_string(),
+                username: options.username,
+                port: options.port,
+            }),
+            remote::RemoteConnectionOptions::Wsl(options) => Some(DevContainerProjectHost::Wsl {
+                distro_name: options.distro_name,
+                user: options.user,
+            }),
+            _ => None,
+        });
+    let devcontainer_config = project_host
+        .as_ref()
+        .map(|_| context.project_directory.join(&actual_config.config_path));
 
     match spawn_dev_container(
         &context,
@@ -295,6 +316,12 @@ pub async fn start_dev_container_with_config(
                 remote_user,
                 extension_ids,
                 remote_env: remote_env.into_iter().collect(),
+                project_host,
+                project_root: context
+                    .project_host
+                    .remote_connection_options()
+                    .map(|_| context.project_directory.display().to_string()),
+                devcontainer_config: devcontainer_config.map(|path| path.display().to_string()),
             };
 
             Ok((connection, remote_workspace_folder))

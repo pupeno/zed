@@ -194,6 +194,12 @@ impl ProjectHost {
         self.filesystem.project_root()
     }
 
+    pub fn remote_connection_options(&self) -> Option<RemoteConnectionOptions> {
+        self.connection
+            .as_ref()
+            .map(|connection| connection.connection_options())
+    }
+
     pub async fn temporary_root(&self) -> Result<PathBuf> {
         if self.connection.is_none() {
             return Ok(std::env::temp_dir());
@@ -411,15 +417,8 @@ impl ProjectHost {
     }
 
     pub fn start_process(&self, request: HostProcessRequest) -> Result<HostProcess> {
-        let mut command = if let Some(connection) = &self.connection {
-            let template = connection.build_command(
-                Some(request.program),
-                &request.arguments,
-                &request.environment,
-                Some(request.working_directory.display().to_string()),
-                None,
-                Interactive::No,
-            )?;
+        let mut command = if self.connection.is_some() {
+            let template = self.build_command(request, Interactive::No)?;
             command_from_template(template)
         } else {
             let mut command = Command::new(request.program);
@@ -437,6 +436,25 @@ impl ProjectHost {
             .stderr(Stdio::piped());
         let child = command.spawn().context("starting host process")?;
         Ok(HostProcess { child })
+    }
+
+    pub fn build_command(
+        &self,
+        request: HostProcessRequest,
+        interactive: Interactive,
+    ) -> Result<crate::CommandTemplate> {
+        let connection = self
+            .connection
+            .as_ref()
+            .context("local project hosts do not build remote commands")?;
+        connection.build_command(
+            Some(request.program),
+            &request.arguments,
+            &request.environment,
+            Some(request.working_directory.display().to_string()),
+            None,
+            interactive,
+        )
     }
 
     pub fn stage_assets(

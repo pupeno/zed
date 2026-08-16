@@ -12,11 +12,14 @@ use gpui::{AppContext, AsyncApp, PromptLevel, WindowHandle};
 
 use project::trusted_worktrees;
 use remote::{
-    DockerConnectionOptions, Interactive, RemoteConnection, RemoteConnectionOptions,
-    SshConnectionOptions,
+    DockerConnectionOptions, HostDockerConnectionOptions, Interactive,
+    ProjectHostConnectionOptions, RemoteConnection, RemoteConnectionOptions, SshConnectionOptions,
 };
 pub use settings::SshConnection;
-use settings::{DevContainerConnection, ExtendingVec, RegisterSetting, Settings, WslConnection};
+use settings::{
+    DevContainerConnection, DevContainerProjectHost, ExtendingVec, RegisterSetting, Settings,
+    WslConnection,
+};
 use util::paths::PathWithPosition;
 use workspace::{
     AppState, MultiWorkspace, OpenOptions, SerializedWorkspaceLocation, Workspace,
@@ -90,14 +93,43 @@ impl From<Connection> for RemoteConnectionOptions {
             Connection::Ssh(conn) => RemoteConnectionOptions::Ssh(conn.into()),
             Connection::Wsl(conn) => RemoteConnectionOptions::Wsl(conn.into()),
             Connection::DevContainer(conn) => {
-                RemoteConnectionOptions::Docker(DockerConnectionOptions {
+                let container = DockerConnectionOptions {
                     name: conn.name,
                     remote_user: conn.remote_user,
                     container_id: conn.container_id,
                     upload_binary_over_docker_exec: false,
                     use_podman: conn.use_podman,
                     remote_env: conn.remote_env,
-                })
+                };
+                let project_host = match conn.project_host {
+                    Some(DevContainerProjectHost::Ssh {
+                        host,
+                        username,
+                        port,
+                    }) => Some(ProjectHostConnectionOptions::Ssh(SshConnectionOptions {
+                        host: host.into(),
+                        username,
+                        port,
+                        ..Default::default()
+                    })),
+                    Some(DevContainerProjectHost::Wsl { distro_name, user }) => {
+                        Some(ProjectHostConnectionOptions::Wsl(
+                            remote::WslConnectionOptions { distro_name, user },
+                        ))
+                    }
+                    None => None,
+                };
+                match (project_host, conn.project_root, conn.devcontainer_config) {
+                    (Some(project_host), Some(project_root), Some(devcontainer_config)) => {
+                        RemoteConnectionOptions::HostDocker(HostDockerConnectionOptions {
+                            project_host,
+                            project_root: project_root.into(),
+                            devcontainer_config: devcontainer_config.into(),
+                            container,
+                        })
+                    }
+                    _ => RemoteConnectionOptions::Docker(container),
+                }
             }
         }
     }
@@ -321,6 +353,9 @@ pub async fn open_remote_project(
                                 RemoteConnectionOptions::Docker(_) => {
                                     "Failed to connect to Dev Container"
                                 }
+                                RemoteConnectionOptions::HostDocker(_) => {
+                                    "Failed to connect to Dev Container"
+                                }
                                 #[cfg(any(test, feature = "test-support"))]
                                 RemoteConnectionOptions::Mock(_) => {
                                     "Failed to connect to mock server"
@@ -380,6 +415,9 @@ pub async fn open_remote_project(
                                 RemoteConnectionOptions::Ssh(_) => "Failed to connect over SSH",
                                 RemoteConnectionOptions::Wsl(_) => "Failed to connect to WSL",
                                 RemoteConnectionOptions::Docker(_) => {
+                                    "Failed to connect to Dev Container"
+                                }
+                                RemoteConnectionOptions::HostDocker(_) => {
                                     "Failed to connect to Dev Container"
                                 }
                                 #[cfg(any(test, feature = "test-support"))]
@@ -521,6 +559,41 @@ mod tests {
     use serde_json::json;
     use util::path;
     use workspace::find_existing_workspace;
+
+    #[test]
+    fn host_backed_dev_container_reconstructs_a_host_docker_connection() {
+        let connection = Connection::DevContainer(DevContainerConnection {
+            name: "zed".to_string(),
+            remote_user: "vscode".to_string(),
+            container_id: "container-id".to_string(),
+            use_podman: true,
+            remote_env: [("PATH".to_string(), "/custom/bin".to_string())]
+                .into_iter()
+                .collect(),
+            project_host: Some(DevContainerProjectHost::Ssh {
+                host: "example.com".to_string(),
+                username: Some("zed".to_string()),
+                port: Some(2222),
+            }),
+            project_root: Some("/work/zed".to_string()),
+            devcontainer_config: Some("/work/zed/.devcontainer/devcontainer.json".to_string()),
+            ..Default::default()
+        });
+
+        let RemoteConnectionOptions::HostDocker(connection) =
+            RemoteConnectionOptions::from(connection)
+        else {
+            panic!("host-backed Dev Container must not reconstruct as a local Docker connection");
+        };
+
+        assert_eq!(connection.project_root, PathBuf::from("/work/zed"));
+        assert_eq!(
+            connection.devcontainer_config,
+            PathBuf::from("/work/zed/.devcontainer/devcontainer.json")
+        );
+        assert!(connection.container.use_podman);
+        assert_eq!(connection.container.remote_user, "vscode");
+    }
 
     #[gpui::test]
     async fn test_open_remote_project_with_mock_connection(

@@ -99,7 +99,8 @@ impl Display for DevContainerError {
                 DevContainerError::DockerNotAvailable =>
                     "Docker or Podman CLI/engine is not available".to_string(),
                 DevContainerError::ContainerEngineNotReachableLocally =>
-                    "The container engine accessed from the project differs from the one accessed by Zed making it impossible for Zed to open this dev container."
+                    "The container engine accessed from the project differs from the one accessed \
+                     by Zed making it impossible for Zed to open this dev container."
                         .to_string(),
                 DevContainerError::ContainerNotValid(id) => format!(
                     "docker image {id} did not have expected configuration for a dev container"

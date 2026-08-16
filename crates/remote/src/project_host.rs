@@ -13,13 +13,27 @@ use util::{
     paths::{PathStyle, RemotePathBuf},
 };
 
+/// The machine that owns a project and runs project-scoped tooling.
+///
+/// A project host is either the desktop itself or the SSH/WSL environment that
+/// contains the project. It is deliberately distinct from a development
+/// container: commands that prepare or manage a container must run on the
+/// project host, using that host's filesystem and path conventions.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProjectHostKind {
+    /// The desktop on which Zed is running.
     Local,
+    /// An environment reached through SSH.
     Ssh,
+    /// A Windows Subsystem for Linux distribution.
     Wsl,
 }
 
+/// Filesystem details needed to construct paths for a [`ProjectHost`].
+///
+/// The host may use a path syntax different from the desktop's. Build paths
+/// through this type when they will be sent to the host, rather than relying on
+/// the local platform's [`std::path::PathBuf`] joining behavior.
 #[derive(Clone, Debug)]
 pub struct ProjectHostFilesystem {
     project_root: Arc<Path>,
@@ -27,18 +41,27 @@ pub struct ProjectHostFilesystem {
 }
 
 impl ProjectHostFilesystem {
+    /// Returns the root directory of the project on the host.
     pub fn project_root(&self) -> &Path {
         &self.project_root
     }
 
+    /// Returns the path syntax used by the host.
     pub fn path_style(&self) -> PathStyle {
         self.path_style
     }
 
+    /// Returns `path` rooted at the host project directory.
+    ///
+    /// Absolute paths are returned unchanged; relative paths are joined using
+    /// the host's path syntax.
     pub fn project_path(&self, path: impl AsRef<Path>) -> RemotePathBuf {
         host_path(self.project_root(), path.as_ref(), self.path_style)
     }
 
+    /// Returns `path` rooted at `temporary_root` using the host's path syntax.
+    ///
+    /// Absolute paths are returned unchanged.
     pub fn temporary_path(
         &self,
         temporary_root: impl AsRef<Path>,
@@ -48,6 +71,11 @@ impl ProjectHostFilesystem {
     }
 }
 
+/// A command to run on a [`ProjectHost`].
+///
+/// The request owns its program, arguments, environment, and working
+/// directory so it can be passed to either a local process or a remote command
+/// template. The working directory must be expressed in the host's path style.
 #[derive(Clone, Debug)]
 pub struct HostProcessRequest {
     program: String,
@@ -57,6 +85,7 @@ pub struct HostProcessRequest {
 }
 
 impl HostProcessRequest {
+    /// Creates a request with no arguments or environment overrides.
     pub fn new(program: impl Into<String>, working_directory: impl Into<PathBuf>) -> Self {
         Self {
             program: program.into(),
@@ -66,11 +95,13 @@ impl HostProcessRequest {
         }
     }
 
+    /// Sets the complete argument list for the command.
     pub fn arguments(mut self, arguments: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.arguments = arguments.into_iter().map(Into::into).collect();
         self
     }
 
+    /// Sets the complete set of environment variables for the command.
     pub fn environment(
         mut self,
         environment: impl IntoIterator<Item = (impl Into<String>, impl Into<String>)>,
@@ -82,23 +113,38 @@ impl HostProcessRequest {
         self
     }
 
+    /// Returns the requested working directory on the host.
     pub fn working_directory(&self) -> &Path {
         &self.working_directory
     }
 }
 
+/// The exit status and captured output of a completed host process.
 #[derive(Debug)]
 pub struct HostProcessOutcome {
+    /// The process's final exit status. A non-successful status is reported
+    /// here rather than converted into an error.
     pub status: ExitStatus,
+    /// All bytes written to standard output.
     pub stdout: Vec<u8>,
+    /// All bytes written to standard error.
     pub stderr: Vec<u8>,
 }
 
+/// A running process on a [`ProjectHost`].
+///
+/// Standard input, output, and error are piped. Dropping this handle cancels
+/// the child process; use [`Self::collect_output`] to wait for it and retain its
+/// output.
 pub struct HostProcess {
     child: Child,
 }
 
 impl HostProcess {
+    /// Waits for the process and returns its exit status and captured output.
+    ///
+    /// A non-zero exit status is preserved in the outcome; only failures to
+    /// wait for or collect from the process return an error.
     pub async fn collect_output(self) -> Result<HostProcessOutcome> {
         let output = self
             .child
@@ -112,6 +158,7 @@ impl HostProcess {
         })
     }
 
+    /// Requests termination of the running process.
     pub async fn cancel(&mut self) -> Result<()> {
         self.child.kill().context("cancelling host process")
     }
@@ -136,6 +183,12 @@ impl PathKind {
     }
 }
 
+/// Provides host-aware filesystem operations, command execution, and asset staging.
+///
+/// This is the boundary between desktop-local work and work that must happen
+/// where the project lives. Its filesystem methods accept paths on the project
+/// host, while [`Self::stage_assets`] accepts a desktop-local source and moves
+/// it to a host destination.
 pub struct ProjectHost {
     kind: ProjectHostKind,
     filesystem: ProjectHostFilesystem,
@@ -143,6 +196,7 @@ pub struct ProjectHost {
 }
 
 impl ProjectHost {
+    /// Creates a host for a project stored on the local desktop.
     pub fn local(project_root: impl Into<Arc<Path>>) -> Self {
         let project_root = project_root.into();
         Self {
@@ -155,6 +209,10 @@ impl ProjectHost {
         }
     }
 
+    /// Creates a host backed by an SSH or WSL connection.
+    ///
+    /// Other remote connection kinds cannot serve as project hosts and return
+    /// an error.
     pub fn from_remote_connection(
         project_root: impl Into<Arc<Path>>,
         connection: Arc<dyn RemoteConnection>,
@@ -172,6 +230,10 @@ impl ProjectHost {
         })
     }
 
+    /// Creates a host from the connection currently held by `client`.
+    ///
+    /// Returns an error when the client is not connected or its connection
+    /// kind cannot host a project.
     pub fn from_remote_client(
         project_root: impl Into<Arc<Path>>,
         client: &crate::RemoteClient,
@@ -182,24 +244,32 @@ impl ProjectHost {
         Self::from_remote_connection(project_root, connection)
     }
 
+    /// Returns how this project host is reached.
     pub fn kind(&self) -> ProjectHostKind {
         self.kind
     }
 
+    /// Returns filesystem details for building paths understood by this host.
     pub fn filesystem(&self) -> &ProjectHostFilesystem {
         &self.filesystem
     }
 
+    /// Returns the project's root directory on this host.
     pub fn project_root(&self) -> &Path {
         self.filesystem.project_root()
     }
 
+    /// Returns the remote connection options when this host is remote.
     pub fn remote_connection_options(&self) -> Option<RemoteConnectionOptions> {
         self.connection
             .as_ref()
             .map(|connection| connection.connection_options())
     }
 
+    /// Determines the temporary directory root on the project host.
+    ///
+    /// For a local host this is the desktop process's temporary directory. For
+    /// a remote host it is queried from that host's shell environment.
     pub async fn temporary_root(&self) -> Result<PathBuf> {
         if self.connection.is_none() {
             return Ok(std::env::temp_dir());
@@ -227,6 +297,9 @@ impl ProjectHost {
         Ok(PathBuf::from(temporary_root))
     }
 
+    /// Reads a file that exists on the project host.
+    ///
+    /// `path` must use the project's host path convention.
     pub async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
         if self.connection.is_none() {
             return std::fs::read(path)
@@ -255,10 +328,12 @@ impl ProjectHost {
         Ok(outcome.stdout)
     }
 
+    /// Returns whether `path` is a regular file on the project host.
     pub async fn is_file(&self, path: &Path) -> Result<bool> {
         self.path_exists(path, PathKind::File).await
     }
 
+    /// Returns whether `path` is a directory on the project host.
     pub async fn is_dir(&self, path: &Path) -> Result<bool> {
         self.path_exists(path, PathKind::Directory).await
     }
@@ -294,9 +369,10 @@ impl ProjectHost {
         Ok(outcome.status.success())
     }
 
-    /// Copies a directory that already lives on the project host into another
-    /// project-host directory. This is a host-relative filesystem operation, not
-    /// [`ProjectHost::stage_assets`], which moves desktop-local assets onto the host.
+    /// Copies the contents of a host directory into another host directory.
+    ///
+    /// This is a host-to-host filesystem operation. To move assets from the
+    /// desktop onto the host, use [`Self::stage_assets`] instead.
     pub async fn copy_dir(&self, source: &Path, destination: &Path) -> Result<()> {
         if self.connection.is_none() {
             return copy_directory(source, destination).with_context(|| {
@@ -337,6 +413,7 @@ impl ProjectHost {
         Ok(())
     }
 
+    /// Creates a directory and any missing parent directories on the project host.
     pub async fn create_dir_all(&self, path: &Path) -> Result<()> {
         if self.connection.is_none() {
             return std::fs::create_dir_all(path)
@@ -365,6 +442,7 @@ impl ProjectHost {
         Ok(())
     }
 
+    /// Writes `content` to a file on the project host, replacing it if present.
     pub async fn write_file(&self, path: &Path, content: &[u8]) -> Result<()> {
         if self.connection.is_none() {
             return std::fs::write(path, content)
@@ -416,6 +494,11 @@ impl ProjectHost {
         Ok(())
     }
 
+    /// Starts a command on the project host with piped standard streams.
+    ///
+    /// The process is killed if the returned [`HostProcess`] is dropped before
+    /// completion. Use [`HostProcess::collect_output`] to wait for it, or
+    /// [`HostProcess::into_child`] for callers that must stream its pipes.
     pub fn start_process(&self, request: HostProcessRequest) -> Result<HostProcess> {
         let mut command = if self.connection.is_some() {
             let template = self.build_command(request, Interactive::No)?;
@@ -438,6 +521,12 @@ impl ProjectHost {
         Ok(HostProcess { child })
     }
 
+    /// Builds the remote command template for a host process request.
+    ///
+    /// This exposes the connection-specific command construction for callers
+    /// that need to launch the process themselves. It returns an error for a
+    /// local host; use [`Self::start_process`] when a ready-to-run process is
+    /// needed instead.
     pub fn build_command(
         &self,
         request: HostProcessRequest,
@@ -457,6 +546,11 @@ impl ProjectHost {
         )
     }
 
+    /// Stages desktop-local directory contents at `host_destination`.
+    ///
+    /// Remote hosts upload through their connection; local hosts copy in a
+    /// background task. `desktop_source` is always interpreted on the desktop,
+    /// while `host_destination` must use the project's host path convention.
     pub fn stage_assets(
         &self,
         desktop_source: PathBuf,

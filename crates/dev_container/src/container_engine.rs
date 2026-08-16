@@ -52,7 +52,7 @@ impl ContainerEngine {
 
     /// Remote engine selections must be compared with Zed's local selection.
     pub(crate) fn requires_local_engine_match_verification(&self) -> bool {
-        self.command_builder.connection_options().is_some()
+        self.command_builder.is_remote()
     }
 
     pub(crate) fn command(&self, program: impl AsRef<str>) -> ProjectCommand<'_> {
@@ -87,14 +87,6 @@ impl ContainerEngine {
             PathBuf::from(self.path_style.normalize(&path.to_string_lossy()))
         } else {
             util::normalize_path(path)
-        }
-    }
-
-    pub(crate) fn temporary_directory(&self) -> PathBuf {
-        if self.path_style.is_posix() {
-            PathBuf::from("/tmp/devcontainer-zed")
-        } else {
-            std::env::temp_dir().join("devcontainer-zed")
         }
     }
 

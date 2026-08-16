@@ -147,6 +147,17 @@ impl DevContainerManifest {
         })
     }
 
+    async fn project_temporary_directory(&self) -> Result<PathBuf, DevContainerError> {
+        self.engine
+            .command_builder
+            .project_temporary_directory()
+            .await
+            .map_err(|error| {
+                log::error!("Failed to create a project temporary directory: {error:?}");
+                DevContainerError::FilesystemError
+            })
+    }
+
     /// Reads a numeric id for the user who owns the project directory.
     ///
     /// The command runs through the project connection so the UID and GID
@@ -511,7 +522,7 @@ impl DevContainerManifest {
         let root_image_tag = self.get_base_image_from_config().await?;
         let root_image = self.docker_client.inspect(&root_image_tag).await?;
 
-        let temp_base = self.engine.temporary_directory();
+        let temp_base = self.project_temporary_directory().await?;
         let timestamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis())
@@ -1265,7 +1276,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
                 volumes: HashMap::new(),
             };
 
-            let temp_base = self.engine.temporary_directory();
+            let temp_base = self.project_temporary_directory().await?;
             let config_location = self
                 .engine
                 .join_path(&temp_base, "docker_compose_build.json");
@@ -1369,7 +1380,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
                     volumes: HashMap::new(),
                 };
 
-                let temp_base = self.engine.temporary_directory();
+                let temp_base = self.project_temporary_directory().await?;
                 let config_location = self
                     .engine
                     .join_path(&temp_base, "docker_compose_build.json");
@@ -1441,7 +1452,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
     ) -> Result<PathBuf, DevContainerError> {
         let config =
             self.build_runtime_override(main_service_name, network_mode_service, resources)?;
-        let temp_base = self.engine.temporary_directory();
+        let temp_base = self.project_temporary_directory().await?;
         let config_location = self
             .engine
             .join_path(&temp_base, "docker_compose_runtime.json");

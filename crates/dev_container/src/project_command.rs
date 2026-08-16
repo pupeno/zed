@@ -1,8 +1,8 @@
 //! Project-local and project-remote command construction.
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
-use anyhow::{Result, anyhow};
+use anyhow::{Context as _, Result, anyhow, bail};
 use collections::HashMap;
 use remote::{Interactive, RemoteConnection, RemoteConnectionOptions};
 use util::command::Command;
@@ -37,6 +37,51 @@ impl ProjectCommandBuilder {
         self.connection
             .as_ref()
             .map(|connection| connection.connection_options())
+    }
+
+    pub(crate) fn is_remote(&self) -> bool {
+        self.connection.is_some()
+    }
+
+    /// Creates a temporary directory where project commands can use it.
+    pub(crate) async fn project_temporary_directory(&self) -> Result<PathBuf> {
+        let Some(connection) = &self.connection else {
+            return Ok(std::env::temp_dir());
+        };
+
+        let command = if connection.path_style().is_posix() {
+            let mut command = self.command("mktemp");
+            command.arg("-d");
+            command
+        } else {
+            let mut command = self.command("powershell");
+            command.args([
+                "-NoProfile",
+                "-Command",
+                "New-Item -ItemType Directory -Path (Join-Path $env:TEMP ('devcontainer-zed-' + [guid]::NewGuid())) | Select-Object -ExpandProperty FullName",
+            ]);
+            command
+        };
+        let output = command
+            .build()
+            .context("building a command to create a project temporary directory")?
+            .output()
+            .await
+            .context("creating a project temporary directory")?;
+
+        if !output.status.success() {
+            bail!(
+                "creating a project temporary directory failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let temporary_directory = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if temporary_directory.is_empty() {
+            bail!("creating a project temporary directory returned no path");
+        }
+
+        Ok(PathBuf::from(temporary_directory))
     }
 
     /// Starts describing a command to run in the project.

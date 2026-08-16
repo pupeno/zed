@@ -51,6 +51,7 @@ mod devcontainer_manifest;
 mod docker;
 mod features;
 mod oci;
+mod project_command;
 
 use devcontainer_api::read_default_devcontainer_configuration;
 

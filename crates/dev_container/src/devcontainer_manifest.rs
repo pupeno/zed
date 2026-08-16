@@ -10,12 +10,13 @@ use regex::Regex;
 
 use fs::Fs;
 use http_client::HttpClient;
+use remote::Interactive;
 use util::{ResultExt, command::Command, normalize_path, paths::PathStyle};
 
 use crate::{
     DevContainerConfig, DevContainerContext,
     command_json::{CommandRunner, DefaultCommandRunner},
-    container_engine::{CommandSpec, ContainerEngine},
+    container_engine::ContainerEngine,
     devcontainer_api::{DevContainerError, DevContainerUp},
     devcontainer_json::{
         ContainerBuild, DevContainer, DevContainerBuildType, FeatureOptions, ForwardPort,
@@ -152,11 +153,26 @@ impl DevContainerManifest {
         project_temporary_directory(self.project_path_style)
     }
 
-    fn engine_command(&self, spec: CommandSpec) -> Result<Command, DevContainerError> {
-        self.engine.command(spec).map_err(|error| {
-            log::error!("Failed to construct command for the container engine: {error:?}");
-            DevContainerError::CommandFailed(self.docker_client.docker_cli())
-        })
+    fn engine_command(
+        &self,
+        program: String,
+        args: &[String],
+        environment: &collections::HashMap<String, String>,
+    ) -> Result<Command, DevContainerError> {
+        self.engine
+            .command_builder
+            .build_command(
+                Some(program),
+                args,
+                environment,
+                None,
+                None,
+                Interactive::No,
+            )
+            .map_err(|error| {
+                log::error!("Failed to construct command for the container engine: {error:?}");
+                DevContainerError::CommandFailed(self.docker_client.docker_cli())
+            })
     }
 
     /// Reads a numeric id from `id` on the machine that hosts the engine.
@@ -167,14 +183,17 @@ impl DevContainerManifest {
     /// an id from the wrong user namespace, and on Windows there is no `id` at
     /// all.
     async fn host_id(&self, flag: &str) -> Result<u32, DevContainerError> {
-        let mut spec = CommandSpec::new("id");
-        spec.arg(flag);
+        let args = vec![flag.to_string()];
         let label = format!("id {flag}");
 
-        let output = self.engine_command(spec)?.output().await.map_err(|e| {
-            log::error!("Failed to get host id ({flag}): {e}");
-            DevContainerError::CommandFailed(label.clone())
-        })?;
+        let output = self
+            .engine_command("id".to_string(), &args, &collections::HashMap::default())?
+            .output()
+            .await
+            .map_err(|e| {
+                log::error!("Failed to get host id ({flag}): {e}");
+                DevContainerError::CommandFailed(label.clone())
+            })?;
 
         String::from_utf8_lossy(&output.stdout)
             .trim()
@@ -1802,26 +1821,37 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
 
         let updated_image_tag = features_build_info.image_tag.clone();
 
-        let mut spec = CommandSpec::new(self.docker_client.docker_cli());
+        let program = self.docker_client.docker_cli();
+        let mut args = Vec::new();
+        let mut environment = collections::HashMap::default();
         // Without a usable BuildKit, force the classic builder: the build's
         // `FROM $BASE_IMAGE` references the locally-built features image, which
         // only resolves from the daemon's image store under the classic builder.
         if !self.docker_client.supports_compose_buildkit()
             && self.docker_client.docker_cli() != "podman"
         {
-            spec.env("DOCKER_BUILDKIT", "0");
+            environment.insert("DOCKER_BUILDKIT".to_string(), "0".to_string());
         }
-        spec.args(["build"]);
-        spec.args(["-f", &dockerfile_path.display().to_string()]);
-        spec.args(["-t", &updated_image_tag]);
-        spec.args(["--build-arg", &format!("BASE_IMAGE={}", base_image)]);
-        spec.args(["--build-arg", &format!("REMOTE_USER={}", remote_user)]);
-        spec.args(["--build-arg", &format!("NEW_UID={}", host_uid)]);
-        spec.args(["--build-arg", &format!("NEW_GID={}", host_gid)]);
-        spec.args(["--build-arg", &format!("IMAGE_USER={}", image_user)]);
-        spec.arg(features_build_info.empty_context_dir.display().to_string());
+        args.push("build".to_string());
+        args.extend(["-f".to_string(), dockerfile_path.display().to_string()]);
+        args.extend(["-t".to_string(), updated_image_tag.clone()]);
+        args.extend([
+            "--build-arg".to_string(),
+            format!("BASE_IMAGE={base_image}"),
+        ]);
+        args.extend([
+            "--build-arg".to_string(),
+            format!("REMOTE_USER={remote_user}"),
+        ]);
+        args.extend(["--build-arg".to_string(), format!("NEW_UID={host_uid}")]);
+        args.extend(["--build-arg".to_string(), format!("NEW_GID={host_gid}")]);
+        args.extend([
+            "--build-arg".to_string(),
+            format!("IMAGE_USER={image_user}"),
+        ]);
+        args.push(features_build_info.empty_context_dir.display().to_string());
 
-        let mut command = self.engine_command(spec)?;
+        let mut command = self.engine_command(program, &args, &environment)?;
         let output = self
             .command_runner
             .run_command(&mut command)
@@ -1917,23 +1947,25 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
                 DevContainerError::FilesystemError
             })?;
 
-        let mut spec = CommandSpec::new(self.docker_client.docker_cli());
+        let program = self.docker_client.docker_cli();
+        let mut args = Vec::new();
+        let mut environment = collections::HashMap::default();
         // This path runs only when BuildKit is unavailable, so force the classic
         // builder: the feature content image is consumed by a later multi-stage
         // `FROM`, which requires it to live in the daemon's image store.
         if self.docker_client.docker_cli() != "podman" {
-            spec.env("DOCKER_BUILDKIT", "0");
+            environment.insert("DOCKER_BUILDKIT".to_string(), "0".to_string());
         }
-        spec.args([
-            "build",
-            "-t",
-            "dev_container_feature_content_temp",
-            "-f",
-            &dockerfile_path.display().to_string(),
-            &features_content_dir.display().to_string(),
+        args.extend([
+            "build".to_string(),
+            "-t".to_string(),
+            "dev_container_feature_content_temp".to_string(),
+            "-f".to_string(),
+            dockerfile_path.display().to_string(),
+            features_content_dir.display().to_string(),
         ]);
 
-        let mut command = self.engine_command(spec)?;
+        let mut command = self.engine_command(program, &args, &environment)?;
         let output = self
             .command_runner
             .run_command(&mut command)
@@ -1971,18 +2003,17 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             );
             return Err(DevContainerError::DevContainerParseFailed);
         };
-        let mut spec = CommandSpec::new(self.docker_client.docker_cli());
-
-        spec.args(["buildx", "build"]);
+        let program = self.docker_client.docker_cli();
+        let mut args = vec!["buildx".to_string(), "build".to_string()];
 
         // --load is short for --output=docker, loading the built image into the local docker images
-        spec.arg("--load");
+        args.push("--load".to_string());
 
         // BuildKit build context: provides the features content directory as a named context
         // that the Dockerfile.extended can COPY from via `--from=dev_containers_feature_content_source`
-        spec.args([
-            "--build-context",
-            &format!(
+        args.extend([
+            "--build-context".to_string(),
+            format!(
                 "dev_containers_feature_content_source={}",
                 features_build_info.features_content_dir.display()
             ),
@@ -1990,20 +2021,20 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
 
         // Build args matching the CLI reference implementation's `getFeaturesBuildOptions`
         if let Some(build_image) = &features_build_info.build_image {
-            spec.args([
-                "--build-arg",
-                &format!("_DEV_CONTAINERS_BASE_IMAGE={}", build_image),
+            args.extend([
+                "--build-arg".to_string(),
+                format!("_DEV_CONTAINERS_BASE_IMAGE={build_image}"),
             ]);
         } else {
-            spec.args([
-                "--build-arg",
-                "_DEV_CONTAINERS_BASE_IMAGE=dev_container_auto_added_stage_label",
+            args.extend([
+                "--build-arg".to_string(),
+                "_DEV_CONTAINERS_BASE_IMAGE=dev_container_auto_added_stage_label".to_string(),
             ]);
         }
 
-        spec.args([
-            "--build-arg",
-            &format!(
+        args.extend([
+            "--build-arg".to_string(),
+            format!(
                 "_DEV_CONTAINERS_IMAGE_USER={}",
                 self.root_image
                     .as_ref()
@@ -2012,14 +2043,14 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             ),
         ]);
 
-        spec.args([
-            "--build-arg",
-            "_DEV_CONTAINERS_FEATURE_CONTENT_SOURCE=dev_container_feature_content_temp",
+        args.extend([
+            "--build-arg".to_string(),
+            "_DEV_CONTAINERS_FEATURE_CONTENT_SOURCE=dev_container_feature_content_temp".to_string(),
         ]);
 
-        if let Some(args) = dev_container.build.as_ref().and_then(|b| b.args.as_ref()) {
-            for (key, value) in args {
-                spec.args(["--build-arg", &format!("{}={}", key, value)]);
+        if let Some(build_args) = dev_container.build.as_ref().and_then(|b| b.args.as_ref()) {
+            for (key, value) in build_args {
+                args.extend(["--build-arg".to_string(), format!("{key}={value}")]);
             }
         }
 
@@ -2029,7 +2060,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             .and_then(|b| b.options.as_ref())
         {
             for option in options {
-                spec.arg(option);
+                args.push(option.to_string());
             }
         }
 
@@ -2039,28 +2070,31 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             .and_then(|b| b.cache_from.as_ref())
         {
             for cache_from_image in cache_from_images {
-                spec.args(["--cache-from", cache_from_image]);
+                args.extend(["--cache-from".to_string(), cache_from_image.to_string()]);
             }
         }
 
-        spec.args(["--target", "dev_containers_target_stage"]);
-
-        spec.args([
-            "-f",
-            &features_build_info.dockerfile_path.display().to_string(),
+        args.extend([
+            "--target".to_string(),
+            "dev_containers_target_stage".to_string(),
         ]);
 
-        spec.args(["-t", &features_build_info.image_tag]);
+        args.extend([
+            "-f".to_string(),
+            features_build_info.dockerfile_path.display().to_string(),
+        ]);
+
+        args.extend(["-t".to_string(), features_build_info.image_tag.clone()]);
 
         if let DevContainerBuildType::Dockerfile(build) = dev_container.build_type() {
-            spec.arg(self.calculate_context_dir(build).display().to_string());
+            args.push(self.calculate_context_dir(build).display().to_string());
         } else {
             // Use an empty folder as the build context to avoid pulling in unneeded files.
             // The actual feature content is supplied via the BuildKit build context above.
-            spec.arg(features_build_info.empty_context_dir.display().to_string());
+            args.push(features_build_info.empty_context_dir.display().to_string());
         }
 
-        self.engine_command(spec)
+        self.engine_command(program, &args, &collections::HashMap::default())
     }
 
     async fn run_docker_compose(
@@ -2085,7 +2119,8 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         resources: &DockerComposeResources,
         behavior: ComposeUpBehavior,
     ) -> Result<(), DevContainerError> {
-        let mut spec = CommandSpec::new(self.docker_client.docker_cli());
+        let program = self.docker_client.docker_cli();
+        let mut args = Vec::new();
         let project_name = self.project_name().await?;
         let compose_services = match self.dev_container().run_services.as_ref() {
             Some(run_services) => {
@@ -2094,19 +2129,23 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             }
             None => None,
         };
-        spec.args(&["compose", "--project-name", &project_name]);
+        args.extend([
+            "compose".to_string(),
+            "--project-name".to_string(),
+            project_name,
+        ]);
         for docker_compose_file in &resources.files {
-            spec.args(&["-f", &docker_compose_file.display().to_string()]);
+            args.extend(["-f".to_string(), docker_compose_file.display().to_string()]);
         }
-        spec.args(&["up", "-d"]);
+        args.extend(["up".to_string(), "-d".to_string()]);
         if matches!(behavior, ComposeUpBehavior::Resume) {
-            spec.arg("--no-recreate");
+            args.push("--no-recreate".to_string());
         }
         if let Some(services) = compose_services.as_ref() {
-            spec.args(services);
+            args.extend(services.iter().cloned());
         }
 
-        let mut command = self.engine_command(spec)?;
+        let mut command = self.engine_command(program, &args, &collections::HashMap::default())?;
         let output = self
             .command_runner
             .run_command(&mut command)
@@ -2224,15 +2263,13 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         let remote_workspace_mount = self.remote_workspace_mount()?;
 
         let docker_cli = self.docker_client.docker_cli();
-        let mut spec = CommandSpec::new(&docker_cli);
-
-        spec.arg("run");
+        let mut args = vec!["run".to_string()];
 
         if build_resources.privileged {
-            spec.arg("--privileged");
+            args.push("--privileged".to_string());
         }
         if build_resources.init {
-            spec.arg("--init");
+            args.push("--init".to_string());
         }
 
         let run_args = match &self.dev_container().run_args {
@@ -2241,38 +2278,38 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         };
 
         for arg in run_args {
-            spec.arg(arg);
+            args.push(arg.to_string());
         }
 
         let run_if_missing = {
-            |arg_name: &str, arg: &str, spec: &mut CommandSpec| {
+            |arg_name: &str, arg: &str, args: &mut Vec<String>| {
                 if !run_args
                     .iter()
                     .any(|arg| arg.strip_prefix(arg_name).is_some())
                 {
-                    spec.arg(arg);
+                    args.push(arg.to_string());
                 }
             }
         };
 
         if &docker_cli == "podman" {
-            run_if_missing("--security-opt", "--security-opt=label=disable", &mut spec);
-            run_if_missing("--userns", "--userns=keep-id", &mut spec);
+            run_if_missing("--security-opt", "--security-opt=label=disable", &mut args);
+            run_if_missing("--userns", "--userns=keep-id", &mut args);
         }
 
-        run_if_missing("--sig-proxy", "--sig-proxy=false", &mut spec);
-        spec.arg("-d");
-        spec.arg("--mount");
-        spec.arg(remote_workspace_mount.to_string());
+        run_if_missing("--sig-proxy", "--sig-proxy=false", &mut args);
+        args.extend([
+            "-d".to_string(),
+            "--mount".to_string(),
+            remote_workspace_mount.to_string(),
+        ]);
 
         for mount in &build_resources.additional_mounts {
-            spec.arg("--mount");
-            spec.arg(mount.to_string());
+            args.extend(["--mount".to_string(), mount.to_string()]);
         }
 
         for (key, val) in self.identifying_labels() {
-            spec.arg("-l");
-            spec.arg(format!("{}={}", key, val));
+            args.extend(["-l".to_string(), format!("{key}={val}")]);
         }
 
         {
@@ -2305,50 +2342,49 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
                     log::error!("Problem serializing metadata: {e}");
                     DevContainerError::ContainerNotValid(build_resources.image.id.clone())
                 })?;
-                spec.arg("-l");
-                spec.arg(format!("devcontainer.metadata={serialized}"));
+                args.extend([
+                    "-l".to_string(),
+                    format!("devcontainer.metadata={serialized}"),
+                ]);
             }
         }
 
         for cap in &build_resources.cap_add {
-            spec.arg("--cap-add");
-            spec.arg(cap);
+            args.extend(["--cap-add".to_string(), cap.to_string()]);
         }
         for opt in &build_resources.security_opt {
-            spec.arg("--security-opt");
-            spec.arg(opt);
+            args.extend(["--security-opt".to_string(), opt.to_string()]);
         }
 
         if let Some(forward_ports) = &self.dev_container().forward_ports {
             for port in forward_ports {
                 if let ForwardPort::Number(port_number) = port {
-                    spec.arg("-p");
-                    spec.arg(format!("{port_number}:{port_number}"));
+                    args.extend(["-p".to_string(), format!("{port_number}:{port_number}")]);
                 }
             }
         }
         for app_port in &self.dev_container().app_port {
-            spec.arg("-p");
-            spec.arg(app_port);
+            args.extend(["-p".to_string(), app_port.to_string()]);
         }
 
         for (key, value) in &build_resources.container_env {
-            spec.arg("-e");
-            spec.arg(format!("{key}={value}"));
+            args.extend(["-e".to_string(), format!("{key}={value}")]);
         }
 
         if let Some(entrypoint_script) = build_resources.entrypoint_script {
-            spec.arg("--entrypoint");
-            spec.arg("/bin/sh");
-            spec.arg(&build_resources.image_tag);
-            spec.arg("-c");
-            spec.arg(entrypoint_script);
-            spec.arg("-");
+            args.extend([
+                "--entrypoint".to_string(),
+                "/bin/sh".to_string(),
+                build_resources.image_tag,
+                "-c".to_string(),
+                entrypoint_script,
+                "-".to_string(),
+            ]);
         } else {
-            spec.arg(&build_resources.image_tag);
+            args.push(build_resources.image_tag);
         }
 
-        self.engine_command(spec)
+        self.engine_command(docker_cli, &args, &collections::HashMap::default())
     }
 
     fn extension_ids(&self) -> Vec<String> {

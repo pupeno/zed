@@ -8,6 +8,7 @@ use std::{
 use futures::TryFutureExt;
 use gpui::{AsyncWindowContext, Entity};
 use project::Worktree;
+use remote::Interactive;
 use serde::Deserialize;
 use settings::{DevContainerConnection, infer_json_indent_size, replace_value_in_json_text};
 use util::rel_path::RelPath;
@@ -17,7 +18,6 @@ use worktree::Snapshot;
 
 use crate::{
     DevContainerContext, DevContainerFeature, DevContainerTemplate,
-    container_engine::CommandSpec,
     devcontainer_json::DevContainer,
     devcontainer_manifest::{read_devcontainer_configuration, spawn_dev_container},
     devcontainer_templates_repository, get_latest_oci_manifest, get_oci_token, ghcr_registry,
@@ -312,6 +312,7 @@ pub async fn start_dev_container_with_config(
 
 async fn check_for_docker(context: &DevContainerContext) -> Result<(), DevContainerError> {
     let project_engine = context.engine.as_ref();
+    // Obtaining the project engine identity also confirms that Docker or Podman can access it.
     let project_engine_identity =
         container_engine_identity(project_engine, context.use_podman).await?;
 
@@ -335,16 +336,25 @@ async fn container_engine_identity(
     use_podman: bool,
 ) -> Result<String, DevContainerError> {
     let engine_cli = if use_podman { "podman" } else { "docker" };
-    let mut spec = CommandSpec::new(engine_cli);
-    spec.args([
-        "info",
-        "--format",
-        container_engine_identity_format(use_podman),
-    ]);
-    let mut command = engine.command(spec).map_err(|error| {
-        log::error!("Unable to construct {engine_cli} info command: {error:?}");
-        DevContainerError::DockerNotAvailable
-    })?;
+    let args = vec![
+        "info".to_string(),
+        "--format".to_string(),
+        container_engine_identity_format(use_podman).to_string(),
+    ];
+    let mut command = engine
+        .command_builder
+        .build_command(
+            Some(engine_cli.to_string()),
+            &args,
+            &collections::HashMap::default(),
+            None,
+            None,
+            Interactive::No,
+        )
+        .map_err(|error| {
+            log::error!("Unable to construct {engine_cli} info command: {error:?}");
+            DevContainerError::DockerNotAvailable
+        })?;
     let output = command.output().await.map_err(|error| {
         log::error!("Unable to run {engine_cli} info: {error:?}");
         DevContainerError::DockerNotAvailable

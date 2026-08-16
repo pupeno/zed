@@ -1,57 +1,17 @@
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::Result;
-use remote::{Interactive, RemoteConnection, RemoteConnectionOptions};
-use util::command::Command;
+use remote::{RemoteConnection, RemoteConnectionOptions};
 use util::paths::PathStyle;
 
-/// A container-engine command, described as plain data.
-#[derive(Debug, Clone)]
-pub(crate) struct CommandSpec {
-    program: String,
-    args: Vec<String>,
-    env: BTreeMap<String, String>,
-}
-
-impl CommandSpec {
-    pub(crate) fn new(program: impl AsRef<str>) -> Self {
-        Self {
-            program: program.as_ref().to_string(),
-            args: Vec::new(),
-            env: BTreeMap::new(),
-        }
-    }
-
-    pub(crate) fn arg(&mut self, arg: impl AsRef<str>) -> &mut Self {
-        self.args.push(arg.as_ref().to_string());
-        self
-    }
-
-    pub(crate) fn args<I, S>(&mut self, args: I) -> &mut Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        self.args
-            .extend(args.into_iter().map(|arg| arg.as_ref().to_string()));
-        self
-    }
-
-    pub(crate) fn env(&mut self, key: impl AsRef<str>, value: impl AsRef<str>) -> &mut Self {
-        self.env
-            .insert(key.as_ref().to_string(), value.as_ref().to_string());
-        self
-    }
-}
+use crate::project_command::ProjectCommandBuilder;
 
 /// The context used to run commands against a container engine.
 ///
 /// Remote connections build their own commands so that each transport controls
 /// quoting, authentication, and process invocation.
 pub(crate) struct ContainerEngine {
-    connection: Option<Arc<dyn RemoteConnection>>,
+    pub(crate) command_builder: ProjectCommandBuilder,
     path_style: PathStyle,
     wsl_distro_name: Option<String>,
 }
@@ -60,13 +20,7 @@ impl std::fmt::Debug for ContainerEngine {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
             .debug_struct("ContainerEngine")
-            .field(
-                "connection",
-                &self
-                    .connection
-                    .as_ref()
-                    .map(|connection| connection.connection_options()),
-            )
+            .field("connection", &self.command_builder.connection_options())
             .finish()
     }
 }
@@ -74,7 +28,7 @@ impl std::fmt::Debug for ContainerEngine {
 impl ContainerEngine {
     pub(crate) fn local() -> Self {
         Self {
-            connection: None,
+            command_builder: ProjectCommandBuilder::local(),
             path_style: if cfg!(windows) {
                 PathStyle::Windows
             } else {
@@ -91,41 +45,14 @@ impl ContainerEngine {
         };
         Self {
             path_style: connection.path_style(),
-            connection: Some(connection),
+            command_builder: ProjectCommandBuilder::for_remote_connection(connection),
             wsl_distro_name,
         }
     }
 
-    pub(crate) fn command(&self, spec: CommandSpec) -> Result<Command> {
-        let CommandSpec { program, args, env } = spec;
-        let Some(connection) = &self.connection else {
-            let mut command = Command::new(program);
-            command.args(args);
-            for (key, value) in env {
-                command.env(key, value);
-            }
-            return Ok(command);
-        };
-        let environment = env.into_iter().collect();
-        let template = connection.build_command(
-            Some(program),
-            &args,
-            &environment,
-            None,
-            None,
-            Interactive::No,
-        )?;
-        let mut command = Command::new(template.program);
-        command.args(template.args);
-        for (key, value) in template.env {
-            command.env(key, value);
-        }
-        Ok(command)
-    }
-
     /// Remote engine selections must be compared with Zed's local selection.
     pub(crate) fn requires_local_engine_match_verification(&self) -> bool {
-        self.connection.is_some()
+        self.command_builder.connection_options().is_some()
     }
 
     pub(crate) fn filesystem_path(&self, path: &Path) -> PathBuf {
@@ -166,6 +93,9 @@ fn wsl_filesystem_path(path: &Path, distro_name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use collections::HashMap;
+    use remote::Interactive;
+    use util::command::Command;
 
     fn rendered(command: &Command) -> Vec<String> {
         std::iter::once(command.get_program())
@@ -176,13 +106,20 @@ mod tests {
 
     #[test]
     fn local_engine_runs_the_program_directly() {
-        let mut spec = CommandSpec::new("docker");
-        spec.args(["ps", "-a"]);
+        let args = vec!["ps".to_string(), "-a".to_string()];
 
         assert_eq!(
             rendered(
                 &ContainerEngine::local()
-                    .command(spec)
+                    .command_builder
+                    .build_command(
+                        Some("docker".to_string()),
+                        &args,
+                        &HashMap::default(),
+                        None,
+                        None,
+                        Interactive::No,
+                    )
                     .expect("command builds")
             ),
             ["docker", "ps", "-a"]

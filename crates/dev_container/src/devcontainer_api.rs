@@ -293,18 +293,11 @@ pub async fn start_dev_container_with_config(
     let project_root = project_host
         .as_ref()
         .map(|_| context.project_host.project_root().clone());
-    let devcontainer_config = project_root.as_ref().map(|project_root| {
-        project_root.join_relative_path(&actual_config.config_path, util::paths::PathStyle::local())
-    });
+    let devcontainer_config = project_root
+        .as_ref()
+        .map(|project_root| project_root.join(actual_config.config_path.to_string_lossy()));
 
-    match spawn_dev_container(
-        &context,
-        environment.clone(),
-        actual_config.clone(),
-        context.project_directory.clone().as_ref(),
-    )
-    .await
-    {
+    match spawn_dev_container(&context, environment.clone(), actual_config.clone()).await {
         Ok(DevContainerUp {
             container_id,
             remote_workspace_folder,

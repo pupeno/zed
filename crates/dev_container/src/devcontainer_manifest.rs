@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     hash::{DefaultHasher, Hash, Hasher},
-    path::{Path, PathBuf},
+    path::PathBuf,
     rc::Rc,
     sync::Arc,
 };
@@ -11,7 +11,7 @@ use regex::Regex;
 
 use fs::Fs;
 use http_client::HttpClient;
-use remote::HostPathBuf;
+use remote::{HostPathBuf, ProjectHostPlatform};
 use util::ResultExt;
 
 use crate::{
@@ -72,11 +72,9 @@ impl DevContainerManifest {
         host: Rc<dyn ProjectHostCapability>,
         docker_client: Rc<dyn DockerClient>,
         local_config: DevContainerConfig,
-        source_root: &Path,
     ) -> Result<Self, DevContainerError> {
-        let source_root = host.host_path(source_root);
-        let config_path = source_root
-            .join_relative_path(&local_config.config_path, util::paths::PathStyle::local());
+        let source_root = host.source_root().clone();
+        let config_path = source_root.join(local_config.config_path.to_string_lossy());
         log::debug!("parsing devcontainer json found in {config_path}");
         let devcontainer_contents = host.read_to_string(&config_path).await.map_err(|e| {
             log::error!("Unable to read devcontainer contents: {e}");
@@ -128,11 +126,11 @@ impl DevContainerManifest {
         let labels = vec![
             (
                 "devcontainer.local_folder",
-                normalize_label_path(self.source_root.as_str()),
+                normalize_label_path(self.source_root.as_str(), self.host.platform()),
             ),
             (
                 "devcontainer.config_file",
-                normalize_label_path(self.config_file().as_str()),
+                normalize_label_path(self.config_file().as_str(), self.host.platform()),
             ),
         ];
         labels
@@ -2669,15 +2667,8 @@ pub(crate) async fn read_devcontainer_configuration(
 ) -> Result<DevContainer, DevContainerError> {
     let host = context.host();
     let docker = docker_for(host.clone(), context).await;
-    let mut dev_container = DevContainerManifest::new(
-        context,
-        environment,
-        host,
-        Rc::new(docker),
-        config,
-        &context.project_directory.as_ref(),
-    )
-    .await?;
+    let mut dev_container =
+        DevContainerManifest::new(context, environment, host, Rc::new(docker), config).await?;
     dev_container.parse_nonremote_vars()?;
     Ok(dev_container.dev_container().clone())
 }
@@ -2696,19 +2687,11 @@ pub(crate) async fn spawn_dev_container(
     context: &DevContainerContext,
     environment: HashMap<String, String>,
     config: DevContainerConfig,
-    source_root: &Path,
 ) -> Result<DevContainerUp, DevContainerError> {
     let host = context.host();
     let docker = docker_for(host.clone(), context).await;
-    let mut devcontainer_manifest = DevContainerManifest::new(
-        context,
-        environment,
-        host,
-        Rc::new(docker),
-        config,
-        source_root,
-    )
-    .await?;
+    let mut devcontainer_manifest =
+        DevContainerManifest::new(context, environment, host, Rc::new(docker), config).await?;
 
     devcontainer_manifest.parse_nonremote_vars()?;
 
@@ -3400,13 +3383,8 @@ fn build_devcontainer_metadata_entry(
         .collect()
 }
 
-fn normalize_label_path(path: &str) -> String {
-    #[cfg(not(target_os = "windows"))]
-    {
-        path.to_string()
-    }
-    #[cfg(target_os = "windows")]
-    {
+fn normalize_label_path(path: &str, platform: ProjectHostPlatform) -> String {
+    if platform.is_windows() {
         let normalized = path.replace('/', "\\");
         if normalized.len() >= 2 && normalized.as_bytes()[1] == b':' {
             let mut result = normalized[..1].to_lowercase();
@@ -3415,6 +3393,8 @@ fn normalize_label_path(path: &str) -> String {
         } else {
             normalized
         }
+    } else {
+        path.to_string()
     }
 }
 
@@ -3433,6 +3413,7 @@ mod test {
     #[cfg(not(target_os = "windows"))]
     use std::{
         fs as std_fs,
+        path::Path,
         time::{SystemTime, UNIX_EPOCH},
     };
 
@@ -3608,15 +3589,9 @@ mod test {
             docker: docker_client.clone(),
             host: host.clone(),
         };
-        let manifest = DevContainerManifest::new(
-            &context,
-            environment,
-            host,
-            docker_client,
-            local_config,
-            &PathBuf::from(TEST_PROJECT_PATH),
-        )
-        .await?;
+        let manifest =
+            DevContainerManifest::new(&context, environment, host, docker_client, local_config)
+                .await?;
 
         Ok((test_dependencies, manifest))
     }
@@ -3764,14 +3739,17 @@ mod test {
         assert_eq!(docker_run_command.program(), "docker");
         let expected_local_folder_label = format!(
             "devcontainer.local_folder={}",
-            super::normalize_label_path(TEST_PROJECT_PATH)
+            super::normalize_label_path(TEST_PROJECT_PATH, devcontainer_manifest.host.platform())
         );
         let expected_config_file_path = PathBuf::from(TEST_PROJECT_PATH)
             .join(".devcontainer")
             .join("devcontainer.json");
         let expected_config_file_label = format!(
             "devcontainer.config_file={}",
-            super::normalize_label_path(&expected_config_file_path.display().to_string())
+            super::normalize_label_path(
+                &expected_config_file_path.display().to_string(),
+                devcontainer_manifest.host.platform(),
+            )
         );
         assert_eq!(
             docker_run_command.get_args(),
@@ -7647,6 +7625,127 @@ RUN echo $RUBY_VERSION2
                 command.program
             );
         }
+    }
+
+    #[gpui::test]
+    async fn remote_dev_container_startup_uses_linux_project_host_paths(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let result = async {
+            let fs = FakeFs::new(cx.executor());
+            let source_root = unix_path("/home/zed/project");
+            let host = Rc::new(RecordingProjectHost::with_platform(
+                source_root.clone(),
+                unix_path("/tmp"),
+                remote::ProjectHostPlatform::Linux,
+                fs.clone(),
+            ));
+            host.respond_with("id", "1000\n");
+            fs.insert_tree(
+                "/home/zed/project/.devcontainer",
+                serde_json::json!({
+                    "devcontainer.json": r#"{
+                    "name": "cli-linux-host",
+                    "build": { "dockerfile": "Dockerfile", "context": "." },
+                    "initializeCommand": "touch initialized",
+                    "updateRemoteUserUID": false
+                }"#,
+                    "Dockerfile": "FROM test_image:latest\n",
+                }),
+            )
+            .await;
+
+            let desktop_project_path = SanitizedPath::new_arc(&PathBuf::from(r"\home\zed\project"));
+            let worktree_store =
+                cx.new(|_cx| WorktreeStore::local(false, fs.clone(), WorktreeIdCounter::default()));
+            let project_environment = cx.new(|cx| {
+                ProjectEnvironment::new(None, worktree_store.downgrade(), None, false, cx)
+            });
+            let context = cx.update(|cx| DevContainerContext {
+                project_directory: SanitizedPath::cast_arc(desktop_project_path),
+                project_host: Arc::new(remote::ProjectHost::local(PathBuf::from(
+                    r"\home\zed\project",
+                ))),
+                use_podman: false,
+                use_buildkit: None,
+                fs: fs.clone(),
+                http_client: fake_http_client(),
+                environment: project_environment.downgrade(),
+                app: cx.to_async(),
+            });
+            let mut manifest = DevContainerManifest::new(
+                &context,
+                HashMap::new(),
+                host.clone(),
+                Rc::new(FakeDocker::new()),
+                DevContainerConfig {
+                    name: "default".to_string(),
+                    config_path: PathBuf::from(".devcontainer/devcontainer.json"),
+                },
+            )
+            .await?;
+
+            assert_eq!(
+                manifest.config_file().as_str(),
+                "/home/zed/project/.devcontainer/devcontainer.json"
+            );
+            manifest.parse_nonremote_vars()?;
+            manifest.build_and_run().await?;
+
+            let commands = host.commands();
+            assert!(commands.iter().any(|command| {
+                command.program == "/bin/sh"
+                    && command.arguments() == ["-c", "touch initialized"]
+                    && command.working_directory == source_root
+            }));
+            assert!(
+                commands
+                    .iter()
+                    .filter(|command| command.program == "docker")
+                    .all(|command| command.working_directory == source_root
+                        && command.args.iter().all(|argument| !argument.contains('\\')))
+            );
+            let docker_arguments = commands
+                .iter()
+                .filter(|command| command.program == "docker")
+                .flat_map(|command| command.args.iter())
+                .collect::<Vec<_>>();
+            for expected in [
+                "/home/zed/project/.devcontainer",
+                "type=bind,source=/home/zed/project,target=/workspaces/project,consistency=cached",
+            ] {
+                assert!(
+                    docker_arguments
+                        .iter()
+                        .any(|argument| argument == &expected),
+                    "Docker must receive {expected}; recorded: {commands:?}"
+                );
+            }
+            assert!(
+                host.reads().iter().any(|path| {
+                    path.as_str() == "/home/zed/project/.devcontainer/devcontainer.json"
+                }),
+                "the configuration must be read through the Linux project host"
+            );
+            assert!(
+                host.reads()
+                    .iter()
+                    .any(|path| { path.as_str() == "/home/zed/project/.devcontainer/Dockerfile" }),
+                "configuration-relative inputs must be read through the Linux project host"
+            );
+            assert_eq!(
+                manifest.identifying_labels(),
+                vec![
+                    ("devcontainer.local_folder", "/home/zed/project".to_string()),
+                    (
+                        "devcontainer.config_file",
+                        "/home/zed/project/.devcontainer/devcontainer.json".to_string(),
+                    ),
+                ]
+            );
+            Result::<(), DevContainerError>::Ok(())
+        }
+        .await;
+        assert!(result.is_ok(), "remote startup failed: {result:?}");
     }
 
     #[gpui::test]

@@ -4,6 +4,7 @@ use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use gpui::AsyncApp;
 use remote::{HostPathBuf, HostProcessRequest, ProjectHost, ProjectHostPlatform};
+#[cfg(test)]
 use util::paths::PathStyle;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -126,20 +127,6 @@ pub(crate) trait ProjectHostCapability {
     #[allow(dead_code)]
     fn platform(&self) -> ProjectHostPlatform;
 
-    fn path_style(&self) -> PathStyle {
-        self.source_root().path_style()
-    }
-
-    /// Reinterprets a [`Path`] that already holds project-host path text.
-    ///
-    /// The text is preserved; only its interpretation moves from the desktop's
-    /// rules to the host's. Paths that are built up rather than received should
-    /// be derived from [`Self::source_root`] instead, so that no desktop-side
-    /// joining happens on the way.
-    fn host_path(&self, path: &Path) -> HostPathBuf {
-        HostPathBuf::from_path(path, self.path_style())
-    }
-
     /// The temporary directory to put generated host artifacts under.
     async fn temporary_root(&self) -> Result<HostPathBuf>;
 
@@ -209,10 +196,6 @@ impl ProjectHostCapability for RemoteProjectHost {
 
     fn platform(&self) -> ProjectHostPlatform {
         self.project_host.platform()
-    }
-
-    fn path_style(&self) -> PathStyle {
-        self.project_host.path_style()
     }
 
     async fn temporary_root(&self) -> Result<HostPathBuf> {
@@ -320,6 +303,7 @@ pub(crate) mod test_support {
         platform: ProjectHostPlatform,
         fs: Arc<FakeFs>,
         commands: Mutex<Vec<RecordedHostCommand>>,
+        reads: Mutex<Vec<HostPathBuf>>,
         staged: Mutex<Vec<(PathBuf, HostPathBuf)>>,
         copied: Mutex<Vec<(HostPathBuf, HostPathBuf)>>,
         outcomes: Mutex<HashMap<String, Output>>,
@@ -362,6 +346,7 @@ pub(crate) mod test_support {
                 platform,
                 fs,
                 commands: Mutex::new(Vec::new()),
+                reads: Mutex::new(Vec::new()),
                 staged: Mutex::new(Vec::new()),
                 copied: Mutex::new(Vec::new()),
                 outcomes: Mutex::new(HashMap::new()),
@@ -380,6 +365,10 @@ pub(crate) mod test_support {
                 .into_iter()
                 .filter(|command| command.program == program)
                 .collect()
+        }
+
+        pub(crate) fn reads(&self) -> Vec<HostPathBuf> {
+            lock(&self.reads).clone()
         }
 
         pub(crate) fn staged_assets(&self) -> Vec<(PathBuf, HostPathBuf)> {
@@ -495,6 +484,7 @@ pub(crate) mod test_support {
         }
 
         async fn read_file(&self, path: &HostPathBuf) -> Result<Vec<u8>> {
+            lock(&self.reads).push(path.clone());
             if lock(&self.unreadable)
                 .iter()
                 .any(|unreadable| unreadable == path)

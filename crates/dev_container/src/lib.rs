@@ -30,7 +30,6 @@ use ui::Tooltip;
 use ui::h_flex;
 use ui::rems_from_px;
 use ui::v_flex;
-use util::shell::Shell;
 
 use gpui::{Action, DismissEvent, EventEmitter, FocusHandle, Focusable, RenderOnce};
 use serde::Deserialize;
@@ -163,7 +162,7 @@ impl DevContainerContext {
 
     pub async fn environment(&self, cx: &mut impl AppContext) -> HashMap<String, String> {
         let Ok(task) = self.environment.update(cx, |this, cx| {
-            this.local_directory_environment(&Shell::System, self.project_directory.clone(), cx)
+            this.directory_environment(self.project_directory.clone(), cx)
         }) else {
             return HashMap::default();
         };
@@ -1722,12 +1721,147 @@ async fn get_ghcr_features(
 
 #[cfg(test)]
 mod tests {
+    use std::{path::PathBuf, sync::Arc};
+
+    use fs::FakeFs;
+    use gpui::{AppContext as _, TestAppContext};
     use http_client::{FakeHttpClient, anyhow};
+    use project::{
+        ProjectEnvironment,
+        worktree_store::{WorktreeIdCounter, WorktreeStore},
+    };
+    use remote::{ProjectHost, RemoteClient};
 
     use crate::{
-        DevContainerTemplatesResponse, devcontainer_templates_repository,
+        DevContainerContext, DevContainerTemplatesResponse, devcontainer_templates_repository,
         get_deserializable_oci_blob, ghcr_registry,
     };
+
+    fn dev_container_context(
+        environment: gpui::WeakEntity<ProjectEnvironment>,
+        project_directory: Arc<std::path::Path>,
+        fs: Arc<FakeFs>,
+        cx: &mut TestAppContext,
+    ) -> DevContainerContext {
+        DevContainerContext {
+            project_host: Arc::new(ProjectHost::local(&project_directory)),
+            project_directory,
+            use_podman: false,
+            use_buildkit: None,
+            fs,
+            http_client: FakeHttpClient::with_404_response(),
+            environment,
+            app: cx.to_async(),
+        }
+    }
+
+    fn project_environment(
+        cli_route: &str,
+        fs: Arc<FakeFs>,
+        remote_client: Option<gpui::WeakEntity<RemoteClient>>,
+        is_remote_project: bool,
+        cx: &mut TestAppContext,
+    ) -> (
+        gpui::Entity<ProjectEnvironment>,
+        gpui::Entity<WorktreeStore>,
+    ) {
+        let worktree_store =
+            cx.new(|_| WorktreeStore::local(false, fs, WorktreeIdCounter::default()));
+        let cli_environment = [(
+            "DEV_CONTAINER_ENVIRONMENT_ROUTE".to_string(),
+            cli_route.to_string(),
+        )]
+        .into_iter()
+        .collect();
+        let environment = cx.new(|cx| {
+            ProjectEnvironment::new(
+                Some(cli_environment),
+                worktree_store.downgrade(),
+                remote_client,
+                is_remote_project,
+                cx,
+            )
+        });
+        (environment, worktree_store)
+    }
+
+    #[gpui::test]
+    async fn dev_container_environment_uses_the_local_project_route(cx: &mut TestAppContext) {
+        let fs = FakeFs::new(cx.executor());
+        let (environment, _worktree_store) =
+            project_environment("local", fs.clone(), None, false, cx);
+        let context = dev_container_context(
+            environment.downgrade(),
+            Arc::from(PathBuf::from("local-project")),
+            fs,
+            cx,
+        );
+
+        assert_eq!(
+            context
+                .environment(cx)
+                .await
+                .get("DEV_CONTAINER_ENVIRONMENT_ROUTE")
+                .map(String::as_str),
+            Some("local")
+        );
+    }
+
+    #[gpui::test]
+    async fn dev_container_environment_uses_the_remote_project_route(
+        cx: &mut TestAppContext,
+        server_cx: &mut TestAppContext,
+    ) {
+        cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+        server_cx.update(|cx| release_channel::init(semver::Version::new(0, 0, 0), cx));
+        let (connection_options, server_session, connect_guard) =
+            RemoteClient::fake_server(cx, server_cx);
+        let ping_handler = server_cx.new(|_| ());
+        server_session.add_request_handler::<rpc::proto::Ping, _, _, _>(
+            ping_handler.downgrade(),
+            |_entity, _envelope, _cx| async { Ok(rpc::proto::Ack {}) },
+        );
+        let environment_handler = server_cx.new(|_| ());
+        server_session.add_request_handler::<rpc::proto::GetDirectoryEnvironment, _, _, _>(
+            environment_handler.downgrade(),
+            |_entity, envelope, _cx| async move {
+                assert_eq!(envelope.payload.directory, "/remote/project");
+                Ok(rpc::proto::DirectoryEnvironment {
+                    environment: std::collections::HashMap::from([(
+                        "DEV_CONTAINER_ENVIRONMENT_ROUTE".to_string(),
+                        "remote".to_string(),
+                    )]),
+                })
+            },
+        );
+        drop(connect_guard);
+        let remote_client = RemoteClient::connect_mock(connection_options, cx).await;
+
+        let fs = FakeFs::new(cx.executor());
+        let (environment, _worktree_store) = project_environment(
+            "desktop-local",
+            fs.clone(),
+            Some(remote_client.downgrade()),
+            true,
+            cx,
+        );
+        let context = dev_container_context(
+            environment.downgrade(),
+            Arc::from(PathBuf::from("/remote/project")),
+            fs,
+            cx,
+        );
+
+        assert_eq!(
+            context
+                .environment(cx)
+                .await
+                .get("DEV_CONTAINER_ENVIRONMENT_ROUTE")
+                .map(String::as_str),
+            Some("remote"),
+            "the remote project directory must use remote environment capture"
+        );
+    }
 
     #[gpui::test]
     async fn test_get_devcontainer_templates() {

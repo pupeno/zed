@@ -7,8 +7,8 @@ pub mod remote_identity;
 mod transport;
 
 pub use project_host::{
-    HostProcess, HostProcessOutcome, HostProcessRequest, ProjectHost, ProjectHostFilesystem,
-    ProjectHostKind,
+    HostPathBuf, HostProcess, HostProcessOutcome, HostProcessRequest, ProjectHost, ProjectHostKind,
+    ProjectHostPlatform,
 };
 #[cfg(target_os = "windows")]
 pub use remote_client::OpenWslPath;

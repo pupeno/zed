@@ -25,8 +25,9 @@ use gpui::{App, AppContext, AsyncApp, Task};
 use rpc::proto::Envelope;
 
 use crate::{
-    HostProcessRequest, ProjectHost, RemoteArch, RemoteClientDelegate, RemoteConnection,
-    RemoteConnectionOptions, RemoteOs, RemotePlatform, SshConnectionOptions, WslConnectionOptions,
+    HostPathBuf, HostProcessRequest, ProjectHost, RemoteArch, RemoteClientDelegate,
+    RemoteConnection, RemoteConnectionOptions, RemoteOs, RemotePlatform, SshConnectionOptions,
+    WslConnectionOptions,
     remote_client::{CommandTemplate, Interactive},
     transport::parse_platform,
 };
@@ -59,8 +60,11 @@ impl ProjectHostConnectionOptions {
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct HostDockerConnectionOptions {
     pub project_host: ProjectHostConnectionOptions,
-    pub project_root: PathBuf,
-    pub devcontainer_config: PathBuf,
+    /// Where the source project lives on the project host, in that host's path
+    /// rules. Recorded as provenance so the container can be traced back to the
+    /// checkout it was built from, whatever desktop reopens it.
+    pub project_root: HostPathBuf,
+    pub devcontainer_config: HostPathBuf,
     pub container: DockerConnectionOptions,
 }
 
@@ -554,7 +558,7 @@ impl DockerExecConnection {
             self.run_docker_command(
                 "cp",
                 &[
-                    staged_path.display().to_string(),
+                    staged_path.as_str().to_string(),
                     format!(
                         "{}:{full_server_path}",
                         self.connection_options.container_id
@@ -595,7 +599,7 @@ impl DockerExecConnection {
         if let Some(project_host) = &self.project_host {
             let outcome = project_host
                 .start_process(
-                    HostProcessRequest::new(self.docker_cli(), project_host.project_root())
+                    HostProcessRequest::new(self.docker_cli(), project_host.project_root().clone())
                         .arguments(
                             std::iter::once(subcommand).chain(args.iter().map(|arg| arg.as_ref())),
                         ),
@@ -811,7 +815,7 @@ impl RemoteConnection for DockerExecConnection {
         let child = if let Some(project_host) = &self.project_host {
             project_host
                 .start_process(
-                    HostProcessRequest::new(self.docker_cli(), project_host.project_root())
+                    HostProcessRequest::new(self.docker_cli(), project_host.project_root().clone())
                         .arguments(docker_args),
                 )
                 .map(|process| process.into_child())
@@ -876,10 +880,10 @@ impl RemoteConnection for DockerExecConnection {
                 staging_task.await?;
                 let output = project_host
                     .start_process(
-                        HostProcessRequest::new(&docker_cli, project_host.project_root())
+                        HostProcessRequest::new(&docker_cli, project_host.project_root().clone())
                             .arguments([
                                 "cp".to_string(),
-                                staged_path.display().to_string(),
+                                staged_path.as_str().to_string(),
                                 format!("{container_id}:{dest_path}"),
                             ]),
                     )?
@@ -892,7 +896,7 @@ impl RemoteConnection for DockerExecConnection {
                 );
                 let output = project_host
                     .start_process(
-                        HostProcessRequest::new(&docker_cli, project_host.project_root())
+                        HostProcessRequest::new(&docker_cli, project_host.project_root().clone())
                             .arguments([
                                 "exec".to_string(),
                                 container_id,
@@ -1001,7 +1005,7 @@ impl RemoteConnection for DockerExecConnection {
 
         if let Some(project_host) = &self.project_host {
             return project_host.build_command(
-                HostProcessRequest::new(self.docker_cli(), project_host.project_root())
+                HostProcessRequest::new(self.docker_cli(), project_host.project_root().clone())
                     .arguments(docker_args),
                 interactive,
             );

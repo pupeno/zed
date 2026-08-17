@@ -1,4 +1,6 @@
-use std::{collections::HashMap, fmt::Display, path::Path};
+use std::{collections::HashMap, fmt::Display};
+
+use remote::HostPathBuf;
 
 use crate::{
     devcontainer_api::DevContainerError,
@@ -376,12 +378,12 @@ impl LifecycleScript {
     pub async fn run(
         &self,
         host: &dyn ProjectHostCapability,
-        working_directory: &Path,
+        working_directory: &HostPathBuf,
     ) -> Result<(), DevContainerError> {
         for (command_name, mut command) in self.script_commands() {
             log::debug!("Running script {command_name}");
 
-            command.current_dir(working_directory);
+            command.current_dir(working_directory.clone());
 
             let output = host.run(&command).await.map_err(|e| {
                 log::error!("Error running command {command_name}: {e}");

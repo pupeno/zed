@@ -1,6 +1,7 @@
-use std::{collections::HashMap, path::PathBuf, rc::Rc};
+use std::{collections::HashMap, rc::Rc};
 
 use async_trait::async_trait;
+use remote::HostPathBuf;
 use serde::{Deserialize, Deserializer, Serialize, de};
 
 use crate::{
@@ -276,11 +277,11 @@ impl Docker {
         command
     }
 
-    fn create_docker_compose_config_command(&self, config_files: &Vec<PathBuf>) -> HostCommand {
+    fn create_docker_compose_config_command(&self, config_files: &Vec<HostPathBuf>) -> HostCommand {
         let mut command = HostCommand::new(&self.docker_cli);
         command.arg("compose");
         for file_path in config_files {
-            command.args(["-f", &file_path.display().to_string()]);
+            command.arg("-f").path_arg(file_path.clone());
         }
         command.arg("config");
         command
@@ -312,7 +313,7 @@ impl DockerClient for Docker {
 
     async fn get_docker_compose_config(
         &self,
-        config_files: &Vec<PathBuf>,
+        config_files: &Vec<HostPathBuf>,
     ) -> Result<Option<DockerComposeConfig>, DevContainerError> {
         let command = self.create_docker_compose_config_command(config_files);
         evaluate_yaml_command(&*self.host, command).await
@@ -320,7 +321,7 @@ impl DockerClient for Docker {
 
     async fn docker_compose_build(
         &self,
-        config_files: &Vec<PathBuf>,
+        config_files: &Vec<HostPathBuf>,
         project_name: &str,
         services: Option<&Vec<String>>,
     ) -> Result<(), DevContainerError> {
@@ -338,7 +339,7 @@ impl DockerClient for Docker {
         }
         command.args(["compose", "--project-name", project_name]);
         for docker_compose_file in config_files {
-            command.args(["-f", &docker_compose_file.display().to_string()]);
+            command.arg("-f").path_arg(docker_compose_file.clone());
         }
         command.arg("build");
         if let Some(services) = services {
@@ -491,11 +492,11 @@ pub(crate) trait DockerClient {
     async fn inspect(&self, id: &String) -> Result<DockerInspect, DevContainerError>;
     async fn get_docker_compose_config(
         &self,
-        config_files: &Vec<PathBuf>,
+        config_files: &Vec<HostPathBuf>,
     ) -> Result<Option<DockerComposeConfig>, DevContainerError>;
     async fn docker_compose_build(
         &self,
-        config_files: &Vec<PathBuf>,
+        config_files: &Vec<HostPathBuf>,
         project_name: &str,
         services: Option<&Vec<String>>,
     ) -> Result<(), DevContainerError>;
@@ -830,10 +831,7 @@ mod test {
         let probes = host.commands_by_program("docker");
         assert_eq!(probes.len(), 1);
         assert_eq!(probes[0].arguments(), vec!["buildx", "version"]);
-        assert_eq!(
-            probes[0].working_directory,
-            std::path::PathBuf::from(TEST_SOURCE_ROOT)
-        );
+        assert_eq!(probes[0].working_directory, host.source_root().clone());
     }
 
     #[gpui::test]
@@ -966,10 +964,7 @@ mod test {
             ],
             "the hook itself belongs to the container; only `docker exec` is a host process"
         );
-        assert_eq!(
-            exec[0].working_directory,
-            std::path::PathBuf::from(TEST_SOURCE_ROOT)
-        );
+        assert_eq!(exec[0].working_directory, host.source_root().clone());
     }
 
     #[gpui::test]

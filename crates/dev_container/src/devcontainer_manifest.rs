@@ -11,7 +11,8 @@ use regex::Regex;
 
 use fs::Fs;
 use http_client::HttpClient;
-use util::{ResultExt, normalize_path};
+use remote::HostPathBuf;
+use util::ResultExt;
 
 use crate::{
     DevContainerConfig, DevContainerContext,
@@ -44,7 +45,7 @@ enum ComposeUpBehavior {
 
 #[derive(Debug, Clone, Eq, PartialEq, Default)]
 pub(crate) struct DockerComposeResources {
-    files: Vec<PathBuf>,
+    files: Vec<HostPathBuf>,
     config: DockerComposeConfig,
 }
 
@@ -56,8 +57,8 @@ struct DevContainerManifest {
     raw_config: String,
     config: ConfigStatus,
     local_environment: HashMap<String, String>,
-    source_root: PathBuf,
-    config_directory: PathBuf,
+    source_root: HostPathBuf,
+    config_directory: HostPathBuf,
     file_name: String,
     root_image: Option<DockerInspect>,
     features_build_info: Option<FeaturesBuildInfo>,
@@ -73,8 +74,10 @@ impl DevContainerManifest {
         local_config: DevContainerConfig,
         source_root: &Path,
     ) -> Result<Self, DevContainerError> {
-        let config_path = source_root.join(local_config.config_path.clone());
-        log::debug!("parsing devcontainer json found in {config_path:?}");
+        let source_root = host.host_path(source_root);
+        let config_path = source_root
+            .join_relative_path(&local_config.config_path, util::paths::PathStyle::local());
+        log::debug!("parsing devcontainer json found in {config_path}");
         let devcontainer_contents = host.read_to_string(&config_path).await.map_err(|e| {
             log::error!("Unable to read devcontainer contents: {e}");
             DevContainerError::DevContainerParseFailed
@@ -86,13 +89,10 @@ impl DevContainerManifest {
             log::error!("Dev container file should be in a directory");
             DevContainerError::NotInValidProject
         })?;
-        let file_name = config_path
-            .file_name()
-            .and_then(|f| f.to_str())
-            .ok_or_else(|| {
-                log::error!("Dev container file has no file name, or is invalid unicode");
-                DevContainerError::DevContainerParseFailed
-            })?;
+        let file_name = config_path.file_name().ok_or_else(|| {
+            log::error!("Dev container file has no file name, or is invalid unicode");
+            DevContainerError::DevContainerParseFailed
+        })?;
 
         Ok(Self {
             fs: context.fs.clone(),
@@ -101,10 +101,10 @@ impl DevContainerManifest {
             docker_client,
             raw_config: devcontainer_contents,
             config: ConfigStatus::Deserialized(devcontainer),
-            source_root: source_root.to_path_buf(),
+            source_root,
             local_environment: environment,
-            config_directory: devcontainer_directory.to_path_buf(),
-            file_name: file_name.to_string(),
+            config_directory: devcontainer_directory,
+            file_name: file_name.to_string_lossy().into_owned(),
             root_image: None,
             features_build_info: None,
             features: Vec::new(),
@@ -128,11 +128,11 @@ impl DevContainerManifest {
         let labels = vec![
             (
                 "devcontainer.local_folder",
-                normalize_label_path(&self.source_root.display().to_string()),
+                normalize_label_path(self.source_root.as_str()),
             ),
             (
                 "devcontainer.config_file",
-                normalize_label_path(&self.config_file().display().to_string()),
+                normalize_label_path(self.config_file().as_str()),
             ),
         ];
         labels
@@ -269,7 +269,7 @@ impl DevContainerManifest {
         replaced
     }
 
-    fn config_file(&self) -> PathBuf {
+    fn config_file(&self) -> HostPathBuf {
         self.config_directory.join(&self.file_name)
     }
 
@@ -280,7 +280,7 @@ impl DevContainerManifest {
         }
     }
 
-    async fn dockerfile_location(&self) -> Option<PathBuf> {
+    async fn dockerfile_location(&self) -> Option<HostPathBuf> {
         let dev_container = self.dev_container();
         match dev_container.build_type() {
             DevContainerBuildType::Image(_) => None,
@@ -376,7 +376,7 @@ impl DevContainerManifest {
         }
     }
 
-    async fn host_artifact_root(&self) -> Result<PathBuf, DevContainerError> {
+    async fn host_artifact_root(&self) -> Result<HostPathBuf, DevContainerError> {
         let temporary_root = self.host.temporary_root().await.map_err(|e| {
             log::error!("Failed to resolve the project host temporary root: {e}");
             DevContainerError::FilesystemError
@@ -389,19 +389,15 @@ impl DevContainerManifest {
     async fn copy_local_feature(
         &self,
         feature_ref: &str,
-        destination: &Path,
+        destination: &HostPathBuf,
     ) -> Result<(), DevContainerError> {
-        let source_path = normalize_path(&self.config_directory.join(feature_ref));
+        let source_path = self.config_directory.join(feature_ref);
 
         if !self.host.is_dir(&source_path).await.map_err(|e| {
-            log::error!("Failed to find local feature directory {source_path:?}: {e}");
+            log::error!("Failed to find local feature directory {source_path}: {e}");
             DevContainerError::FilesystemError
         })? {
-            log::error!(
-                "Local feature directory '{}' not found at {:?}",
-                feature_ref,
-                source_path
-            );
+            log::error!("Local feature directory '{feature_ref}' not found at {source_path}");
             return Err(DevContainerError::ResourceFetchFailed);
         }
 
@@ -409,10 +405,7 @@ impl DevContainerManifest {
             .copy_dir(&source_path, destination)
             .await
             .map_err(|e| {
-                log::error!(
-                    "Failed to copy local feature directory {:?}: {e}",
-                    source_path
-                );
+                log::error!("Failed to copy local feature directory {source_path}: {e}");
                 DevContainerError::FilesystemError
             })?;
 
@@ -463,8 +456,7 @@ impl DevContainerManifest {
             })?;
 
         let dockerfile_path = features_content_dir.join("Dockerfile.extended");
-        let image_tag =
-            self.generate_features_image_tag(dockerfile_path.clone().display().to_string());
+        let image_tag = self.generate_features_image_tag(dockerfile_path.as_str().to_string());
 
         let build_info = FeaturesBuildInfo {
             dockerfile_path,
@@ -604,18 +596,16 @@ impl DevContainerManifest {
                     })?;
             }
 
-            let feature_json_path = &feature_dir.join("devcontainer-feature.json");
-            if !self.host.is_file(feature_json_path).await.map_err(|e| {
+            let feature_json_path = feature_dir.join("devcontainer-feature.json");
+            if !self.host.is_file(&feature_json_path).await.map_err(|e| {
                 log::error!(
-                    "Failed to find devcontainer feature manifest {feature_json_path:?}: {e}"
+                    "Failed to find devcontainer feature manifest {feature_json_path}: {e}"
                 );
                 DevContainerError::FilesystemError
             })? {
-                let message = format!(
-                    "No devcontainer-feature.json found in {:?}, no defaults to apply",
-                    feature_json_path
+                log::error!(
+                    "No devcontainer-feature.json found in {feature_json_path}, no defaults to apply"
                 );
-                log::error!("{message}");
                 return Err(DevContainerError::ResourceFetchFailed);
             }
 
@@ -1079,8 +1069,8 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
         // `config_directory`, so raw entries can carry `..` components.
         let docker_compose_full_paths = docker_compose_files
             .iter()
-            .map(|relative| normalize_path(&self.config_directory.join(relative)))
-            .collect::<Vec<PathBuf>>();
+            .map(|relative| self.config_directory.join(relative))
+            .collect::<Vec<HostPathBuf>>();
 
         let Some(config) = self
             .docker_client
@@ -1158,7 +1148,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
                     "dev_containers_feature_content_source".to_string(),
                     features_build_info
                         .features_content_dir
-                        .display()
+                        .as_str()
                         .to_string(),
                 )]))
             };
@@ -1180,10 +1170,10 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
                                     .as_ref()
                                     .and_then(|b| b.context.clone())
                                     .unwrap_or_else(|| {
-                                        features_build_info.empty_context_dir.display().to_string()
+                                        features_build_info.empty_context_dir.as_str().to_string()
                                     }),
                             ),
-                            dockerfile: Some(dockerfile_path.display().to_string()),
+                            dockerfile: Some(dockerfile_path.as_str().to_string()),
                             target: Some("dev_containers_target_stage".to_string()),
                             args: Some(build_args),
                             additional_contexts,
@@ -1251,7 +1241,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
                         "dev_containers_feature_content_source".to_string(),
                         features_build_info
                             .features_content_dir
-                            .display()
+                            .as_str()
                             .to_string(),
                     )]))
                 };
@@ -1268,9 +1258,9 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
                             labels: None,
                             build: Some(DockerComposeServiceBuild {
                                 context: Some(
-                                    features_build_info.empty_context_dir.display().to_string(),
+                                    features_build_info.empty_context_dir.as_str().to_string(),
                                 ),
-                                dockerfile: Some(dockerfile_path.display().to_string()),
+                                dockerfile: Some(dockerfile_path.as_str().to_string()),
                                 target: Some("dev_containers_target_stage".to_string()),
                                 args: Some(build_args),
                                 additional_contexts,
@@ -1334,7 +1324,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
         main_service_name: &str,
         network_mode_service: Option<&str>,
         resources: DockerBuildResources,
-    ) -> Result<PathBuf, DevContainerError> {
+    ) -> Result<HostPathBuf, DevContainerError> {
         let config =
             self.build_runtime_override(main_service_name, network_mode_service, resources)?;
         self.write_compose_override(&config, "docker_compose_runtime.json")
@@ -1347,7 +1337,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
         &self,
         config: &DockerComposeConfig,
         file_name: &str,
-    ) -> Result<PathBuf, DevContainerError> {
+    ) -> Result<HostPathBuf, DevContainerError> {
         let temp_base = self.host_artifact_root().await?;
         let config_location = temp_base.join(file_name);
 
@@ -1762,14 +1752,14 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
             command.env("DOCKER_BUILDKIT", "0");
         }
         command.args(["build"]);
-        command.args(["-f", &dockerfile_path.display().to_string()]);
+        command.arg("-f").path_arg(dockerfile_path.clone());
         command.args(["-t", &updated_image_tag]);
         command.args(["--build-arg", &format!("BASE_IMAGE={}", base_image)]);
         command.args(["--build-arg", &format!("REMOTE_USER={}", remote_user)]);
         command.args(["--build-arg", &format!("NEW_UID={}", host_uid)]);
         command.args(["--build-arg", &format!("NEW_GID={}", host_gid)]);
         command.args(["--build-arg", &format!("IMAGE_USER={}", image_user)]);
-        command.arg(features_build_info.empty_context_dir.display().to_string());
+        command.path_arg(features_build_info.empty_context_dir.clone());
 
         let output = self.host.run(&command).await.map_err(|e| {
             log::error!("Error building UID update image: {e}");
@@ -1866,14 +1856,10 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         if self.docker_client.docker_cli() != "podman" {
             command.env("DOCKER_BUILDKIT", "0");
         }
-        command.args([
-            "build",
-            "-t",
-            "dev_container_feature_content_temp",
-            "-f",
-            &dockerfile_path.display().to_string(),
-            &features_content_dir.display().to_string(),
-        ]);
+        command.args(["build", "-t", "dev_container_feature_content_temp", "-f"]);
+        command
+            .path_arg(dockerfile_path)
+            .path_arg(features_content_dir.clone());
 
         let output = self.host.run(&command).await.map_err(|e| {
             log::error!("Error building feature content image: {e}");
@@ -1917,13 +1903,10 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
 
         // BuildKit build context: provides the features content directory as a named context
         // that the Dockerfile.extended can COPY from via `--from=dev_containers_feature_content_source`
-        command.args([
-            "--build-context",
-            &format!(
-                "dev_containers_feature_content_source={}",
-                features_build_info.features_content_dir.display()
-            ),
-        ]);
+        command.arg("--build-context").path_arg_with_prefix(
+            "dev_containers_feature_content_source=",
+            features_build_info.features_content_dir.clone(),
+        );
 
         // Build args matching the CLI reference implementation's `getFeaturesBuildOptions`
         if let Some(build_image) = &features_build_info.build_image {
@@ -1982,19 +1965,18 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
 
         command.args(["--target", "dev_containers_target_stage"]);
 
-        command.args([
-            "-f",
-            &features_build_info.dockerfile_path.display().to_string(),
-        ]);
+        command
+            .arg("-f")
+            .path_arg(features_build_info.dockerfile_path.clone());
 
         command.args(["-t", &features_build_info.image_tag]);
 
         if let DevContainerBuildType::Dockerfile(build) = dev_container.build_type() {
-            command.arg(self.calculate_context_dir(build).display().to_string());
+            command.path_arg(self.calculate_context_dir(build));
         } else {
             // Use an empty folder as the build context to avoid pulling in unneeded files.
             // The actual feature content is supplied via the BuildKit build context above.
-            command.arg(features_build_info.empty_context_dir.display().to_string());
+            command.path_arg(features_build_info.empty_context_dir.clone());
         }
 
         Ok(command)
@@ -2033,7 +2015,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         };
         command.args(["compose", "--project-name", &project_name]);
         for docker_compose_file in &resources.files {
-            command.args(["-f", &docker_compose_file.display().to_string()]);
+            command.arg("-f").path_arg(docker_compose_file.clone());
         }
         command.args(["up", "-d"]);
         if matches!(behavior, ComposeUpBehavior::Resume) {
@@ -2087,12 +2069,12 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
     }
 
     fn local_workspace_folder(&self) -> String {
-        self.source_root.display().to_string()
+        self.source_root.as_str().to_string()
     }
     fn local_workspace_base_name(&self) -> Result<String, DevContainerError> {
         self.source_root
             .file_name()
-            .map(|f| f.display().to_string())
+            .map(|file_name| file_name.to_string_lossy().into_owned())
             .ok_or(DevContainerError::DevContainerParseFailed)
     }
 
@@ -2137,7 +2119,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             target: format!(
                 "{}/{}",
                 PathBuf::from(DEFAULT_REMOTE_PROJECT_DIR).display(),
-                project_directory_name.display()
+                project_directory_name.to_string_lossy()
             ),
             mount_type: None,
         })
@@ -2424,7 +2406,9 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
 
         if let Some(initialize_command) = &config.initialize_command {
             log::debug!("Running initialize command");
-            initialize_command.run(&*self.host, &self.source_root).await
+            initialize_command
+                .run(&*self.host, self.host.source_root())
+                .await
         } else {
             log::warn!("No initialize command found");
             Ok(())
@@ -2507,10 +2491,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             .local_workspace_base_name()
             .unwrap_or_else(|_| self.local_workspace_folder());
         let compose_resources = self.docker_compose_manifest().await.ok();
-        let first_compose_file = compose_resources
-            .as_ref()
-            .and_then(|r| r.files.first())
-            .map(PathBuf::as_path);
+        let first_compose_file = compose_resources.as_ref().and_then(|r| r.files.first());
         let compose_config_name = compose_resources
             .as_ref()
             .and_then(|r| r.config.name.as_deref());
@@ -2529,8 +2510,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
                     Ok(contents) => contents,
                     Err(err) => {
                         log::warn!(
-                            "Ignoring unreadable compose fragment `{}` while deriving project name: {err:?}",
-                            file.display()
+                            "Ignoring unreadable compose fragment `{file}` while deriving project name: {err:?}"
                         );
                         continue;
                     }
@@ -2541,7 +2521,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
                 }
             }
         }
-        let dotenv_path = self.source_root.join(".env");
+        let dotenv_path = self.host.source_root().join(".env");
         // Mirrors the CLI: `getProjectName` only swallows `ENOENT`/`EISDIR` on
         // the `.env` read. Any other error (permission denied, I/O failure, …)
         // must surface so we don't silently fall back to a non-canonical project
@@ -2553,8 +2533,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
                 Ok(contents) => Some(contents),
                 Err(err) => {
                     log::error!(
-                        "Failed to read workspace .env `{}` while deriving project name: {err:?}",
-                        dotenv_path.display()
+                        "Failed to read workspace .env `{dotenv_path}` while deriving project name: {err:?}"
                     );
                     return Err(DevContainerError::FilesystemError);
                 }
@@ -2562,8 +2541,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             Ok(false) => None,
             Err(err) => {
                 log::error!(
-                    "Failed to find workspace .env `{}` while deriving project name: {err:?}",
-                    dotenv_path.display()
+                    "Failed to find workspace .env `{dotenv_path}` while deriving project name: {err:?}"
                 );
                 return Err(DevContainerError::FilesystemError);
             }
@@ -2574,7 +2552,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             compose_config_name,
             compose_name_explicitly_declared,
             first_compose_file,
-            &self.source_root,
+            self.host.source_root(),
             &workspace_fallback,
         ))
     }
@@ -2654,16 +2632,13 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
         Ok(parsed_lines.join("\n"))
     }
 
-    fn calculate_context_dir(&self, build: ContainerBuild) -> PathBuf {
-        let Some(context) = build.context else {
-            return self.config_directory.clone();
-        };
-        let context_path = PathBuf::from(context);
-
-        if context_path.is_absolute() {
-            context_path
-        } else {
-            self.config_directory.join(context_path)
+    /// The build context, resolved with the project host's path rules: a
+    /// context the host reads as absolute stands on its own, and anything else
+    /// hangs off the configuration directory.
+    fn calculate_context_dir(&self, build: ContainerBuild) -> HostPathBuf {
+        match build.context {
+            Some(context) => self.config_directory.join(context),
+            None => self.config_directory.clone(),
         }
     }
 }
@@ -2676,11 +2651,11 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) struct FeaturesBuildInfo {
     /// Path to the generated Dockerfile.extended
-    pub dockerfile_path: PathBuf,
+    pub dockerfile_path: HostPathBuf,
     /// Path to the features content directory (used as a BuildKit build context)
-    pub features_content_dir: PathBuf,
+    pub features_content_dir: HostPathBuf,
     /// Path to an empty directory used as the Docker build context
-    pub empty_context_dir: PathBuf,
+    pub empty_context_dir: HostPathBuf,
     /// The base image name (e.g. "mcr.microsoft.com/devcontainers/rust:2-1-bookworm")
     pub build_image: Option<String>,
     /// The tag to apply to the built image (e.g. "vsc-myproject-features")
@@ -2828,26 +2803,19 @@ fn compose_service_list(
 /// Resolves a compose service's dockerfile path according to the Docker Compose spec:
 /// `dockerfile` is relative to the build `context`, and `context` is relative to
 /// the compose file's directory.
+///
+/// Each step resolves with the project host's path rules, so a host-absolute
+/// `context` or `dockerfile` stands on its own instead of being joined onto the
+/// compose file's directory.
 fn resolve_compose_dockerfile(
-    compose_file: &Path,
+    compose_file: &HostPathBuf,
     context: Option<&str>,
     dockerfile: &str,
-) -> Option<PathBuf> {
-    let dockerfile = PathBuf::from(dockerfile);
-    if dockerfile.is_absolute() {
-        return Some(dockerfile);
-    }
+) -> Option<HostPathBuf> {
     let compose_dir = compose_file.parent()?;
     let context_dir = match context {
-        Some(ctx) => {
-            let ctx = PathBuf::from(ctx);
-            if ctx.is_absolute() {
-                ctx
-            } else {
-                normalize_path(&compose_dir.join(ctx))
-            }
-        }
-        None => compose_dir.to_path_buf(),
+        Some(context) => compose_dir.join(context),
+        None => compose_dir,
     };
     Some(context_dir.join(dockerfile))
 }
@@ -2905,8 +2873,8 @@ fn derive_project_name(
     workspace_dotenv_contents: Option<&str>,
     compose_config_name: Option<&str>,
     compose_name_explicitly_declared: bool,
-    first_compose_file: Option<&Path>,
-    workspace_root: &Path,
+    first_compose_file: Option<&HostPathBuf>,
+    workspace_root: &HostPathBuf,
     workspace_fallback: &str,
 ) -> String {
     if let Some(env_name) = local_environment.get("COMPOSE_PROJECT_NAME")
@@ -2926,8 +2894,8 @@ fn derive_project_name(
     {
         return sanitize_compose_project_name(name);
     }
-    let compose_dir = first_compose_file.and_then(Path::parent);
-    let canonical_devcontainer_dir = normalize_path(&workspace_root.join(".devcontainer"));
+    let compose_dir = first_compose_file.and_then(HostPathBuf::parent);
+    let canonical_devcontainer_dir = workspace_root.join(".devcontainer");
     let raw = match compose_dir {
         Some(dir) if dir == canonical_devcontainer_dir => {
             // Matches the CLI's `configDir/.devcontainer` branch: use the
@@ -2937,7 +2905,7 @@ fn derive_project_name(
         }
         Some(dir) => dir
             .file_name()
-            .map(|f| f.to_string_lossy().into_owned())
+            .map(|file_name| file_name.to_string_lossy().into_owned())
             .unwrap_or_else(|| workspace_fallback.to_string()),
         None => format!("{workspace_fallback}_devcontainer"),
     };
@@ -3454,7 +3422,7 @@ fn normalize_label_path(path: &str) -> String {
 mod test {
     use std::{
         collections::HashMap,
-        path::{Path, PathBuf},
+        path::PathBuf,
         rc::Rc,
         sync::{Arc, Mutex},
     };
@@ -3477,8 +3445,9 @@ mod test {
         ProjectEnvironment,
         worktree_store::{WorktreeIdCounter, WorktreeStore},
     };
+    use remote::HostPathBuf;
     use serde_json_lenient::Value;
-    use util::paths::SanitizedPath;
+    use util::paths::{PathStyle, SanitizedPath};
 
     use crate::{
         DevContainerConfig, DevContainerContext,
@@ -3504,13 +3473,17 @@ mod test {
     #[cfg(not(target_os = "windows"))]
     const TEST_PROJECT_PATH: &str = "/path/to/local/project";
     #[cfg(target_os = "windows")]
-    const TEST_PROJECT_PATH: &str = r#"C:\\path\to\local\project"#;
+    const TEST_PROJECT_PATH: &str = r#"C:\path\to\local\project"#;
     /// The project host's temporary root. Deliberately unlike the desktop's, so
     /// artifacts that leak onto the desktop show up as a failing assertion.
     #[cfg(not(target_os = "windows"))]
     const TEST_HOST_TEMP_ROOT: &str = "/host/tmp";
     #[cfg(target_os = "windows")]
     const TEST_HOST_TEMP_ROOT: &str = r#"C:\host\tmp"#;
+
+    fn unix_path(path: &str) -> HostPathBuf {
+        HostPathBuf::from_path(path, PathStyle::Unix)
+    }
 
     async fn build_tarball(content: Vec<(&str, &str)>) -> Vec<u8> {
         let buffer = futures::io::Cursor::new(Vec::new());
@@ -5332,10 +5305,10 @@ RUN apt-get update
             Some("COMPOSE_PROJECT_NAME=from_dotenv\n"),
             Some("from_compose_name"),
             true,
-            Some(Path::new(
+            Some(&unix_path(
                 "/path/to/local/project/.devcontainer/docker-compose.yml",
             )),
-            Path::new("/path/to/local/project"),
+            &unix_path("/path/to/local/project"),
             "project",
         );
         assert_eq!(got, "from_env");
@@ -5353,10 +5326,10 @@ RUN apt-get update
             Some("# comment\nCOMPOSE_PROJECT_NAME=from_dotenv\n"),
             Some("from_compose_name"),
             true,
-            Some(Path::new(
+            Some(&unix_path(
                 "/path/to/local/project/.devcontainer/docker-compose.yml",
             )),
-            Path::new("/path/to/local/project"),
+            &unix_path("/path/to/local/project"),
             "project",
         );
         assert_eq!(got, "from_dotenv");
@@ -5375,10 +5348,10 @@ RUN apt-get update
             None,
             Some("My Compose Project"),
             true,
-            Some(Path::new(
+            Some(&unix_path(
                 "/path/to/local/project/.devcontainer/docker-compose.yml",
             )),
-            Path::new("/path/to/local/project"),
+            &unix_path("/path/to/local/project"),
             "project",
         );
         assert_eq!(got, "mycomposeproject");
@@ -5400,10 +5373,10 @@ RUN apt-get update
             None,
             Some("devcontainer"),
             false,
-            Some(Path::new(
+            Some(&unix_path(
                 "/path/to/myworkspace/.devcontainer/docker-compose.yml",
             )),
-            Path::new("/path/to/myworkspace"),
+            &unix_path("/path/to/myworkspace"),
             "myworkspace",
         );
         assert_eq!(got, "myworkspace_devcontainer");
@@ -5424,8 +5397,8 @@ RUN apt-get update
             None,
             None,
             false,
-            Some(Path::new("/path/to/local/project/docker-compose.yml")),
-            Path::new("/path/to/local/project"),
+            Some(&unix_path("/path/to/local/project/docker-compose.yml")),
+            &unix_path("/path/to/local/project"),
             "project",
         );
         assert_eq!(got, "project");
@@ -5449,10 +5422,10 @@ RUN apt-get update
             None,
             None,
             false,
-            Some(Path::new(
+            Some(&unix_path(
                 "/path/to/local/project/.devcontainer/docker-compose.yml",
             )),
-            Path::new("/path/to/local/project"),
+            &unix_path("/path/to/local/project"),
             "project",
         );
         assert_eq!(got_under, "project_devcontainer");
@@ -5465,8 +5438,8 @@ RUN apt-get update
             None,
             None,
             false,
-            Some(Path::new("/path/to/local/project/docker-compose.yml")),
-            Path::new("/path/to/local/project"),
+            Some(&unix_path("/path/to/local/project/docker-compose.yml")),
+            &unix_path("/path/to/local/project"),
             "project",
         );
         assert_eq!(got_escaped, "project");
@@ -5534,40 +5507,40 @@ RUN apt-get update
 
     #[test]
     fn test_resolve_compose_dockerfile() {
-        let compose = Path::new("/project/.devcontainer/docker-compose.yml");
+        let compose = unix_path("/project/.devcontainer/docker-compose.yml");
 
         // Bug case (#53473): context ".." with relative dockerfile
         assert_eq!(
-            resolve_compose_dockerfile(compose, Some(".."), ".devcontainer/Dockerfile"),
-            Some(PathBuf::from("/project/.devcontainer/Dockerfile")),
+            resolve_compose_dockerfile(&compose, Some(".."), ".devcontainer/Dockerfile"),
+            Some(unix_path("/project/.devcontainer/Dockerfile")),
         );
 
         // Compose path containing ".." (as docker_compose_manifest() produces)
         assert_eq!(
             resolve_compose_dockerfile(
-                Path::new("/project/.devcontainer/../docker-compose.yml"),
+                &unix_path("/project/.devcontainer/../docker-compose.yml"),
                 Some("."),
                 "docker/Dockerfile",
             ),
-            Some(PathBuf::from("/project/docker/Dockerfile")),
+            Some(unix_path("/project/docker/Dockerfile")),
         );
 
         // Absolute dockerfile returned as-is
         assert_eq!(
-            resolve_compose_dockerfile(compose, Some("."), "/absolute/Dockerfile"),
-            Some(PathBuf::from("/absolute/Dockerfile")),
+            resolve_compose_dockerfile(&compose, Some("."), "/absolute/Dockerfile"),
+            Some(unix_path("/absolute/Dockerfile")),
         );
 
         // Absolute context used directly
         assert_eq!(
-            resolve_compose_dockerfile(compose, Some("/abs/context"), "Dockerfile"),
-            Some(PathBuf::from("/abs/context/Dockerfile")),
+            resolve_compose_dockerfile(&compose, Some("/abs/context"), "Dockerfile"),
+            Some(unix_path("/abs/context/Dockerfile")),
         );
 
         // No context defaults to compose file's directory
         assert_eq!(
-            resolve_compose_dockerfile(compose, None, "Dockerfile"),
-            Some(PathBuf::from("/project/.devcontainer/Dockerfile")),
+            resolve_compose_dockerfile(&compose, None, "Dockerfile"),
+            Some(unix_path("/project/.devcontainer/Dockerfile")),
         );
     }
 
@@ -5591,9 +5564,7 @@ RUN apt-get update
 
         devcontainer_manifest.parse_nonremote_vars().unwrap();
 
-        let expected = PathBuf::from(TEST_PROJECT_PATH)
-            .join(".devcontainer")
-            .join("Dockerfile");
+        let expected = source_root().join(".devcontainer/Dockerfile");
         assert_eq!(
             devcontainer_manifest.dockerfile_location().await,
             Some(expected)
@@ -7442,9 +7413,9 @@ RUN echo $RUBY_VERSION2
         }
         async fn get_docker_compose_config(
             &self,
-            config_files: &Vec<PathBuf>,
+            config_files: &Vec<HostPathBuf>,
         ) -> Result<Option<DockerComposeConfig>, DevContainerError> {
-            let project_path = PathBuf::from(TEST_PROJECT_PATH);
+            let project_path = source_root();
             if config_files.len() == 1
                 && config_files.get(0)
                     == Some(
@@ -7593,7 +7564,7 @@ RUN echo $RUBY_VERSION2
         }
         async fn docker_compose_build(
             &self,
-            _config_files: &Vec<PathBuf>,
+            _config_files: &Vec<HostPathBuf>,
             _project_name: &str,
             _services: Option<&Vec<String>>,
         ) -> Result<(), DevContainerError> {
@@ -7655,12 +7626,12 @@ RUN echo $RUBY_VERSION2
         }
     }
 
-    fn source_root() -> PathBuf {
-        PathBuf::from(TEST_PROJECT_PATH)
+    fn source_root() -> HostPathBuf {
+        HostPathBuf::from_path(TEST_PROJECT_PATH, PathStyle::local())
     }
 
-    fn host_artifact_root() -> PathBuf {
-        PathBuf::from(TEST_HOST_TEMP_ROOT).join("devcontainer-zed")
+    fn host_artifact_root() -> HostPathBuf {
+        HostPathBuf::from_path(TEST_HOST_TEMP_ROOT, PathStyle::local()).join("devcontainer-zed")
     }
 
     fn assert_ran_at_source_root(commands: &[RecordedHostCommand]) {
@@ -7785,7 +7756,8 @@ RUN echo $RUBY_VERSION2
             .find(|argument| argument.ends_with("docker_compose_runtime.json"))
             .expect("compose up must be given the generated runtime override");
         assert!(
-            Path::new(override_file).starts_with(host_artifact_root()),
+            HostPathBuf::from_path(override_file, PathStyle::local())
+                .starts_with(&host_artifact_root()),
             "generated compose override must live under the project host temporary root, got {override_file}"
         );
     }
@@ -7817,15 +7789,18 @@ RUN echo $RUBY_VERSION2
             &build_info.empty_context_dir,
         ] {
             assert!(
-                artifact.starts_with(host_artifact_root()),
+                artifact.starts_with(&host_artifact_root()),
                 "{} must be generated under the project host temporary root",
-                artifact.display()
+                artifact
             );
         }
         assert!(
             !build_info
                 .features_content_dir
-                .starts_with(std::env::temp_dir()),
+                .starts_with(&HostPathBuf::from_path(
+                    std::env::temp_dir(),
+                    PathStyle::local(),
+                )),
             "host artifacts must not be left in the desktop temporary directory"
         );
     }
@@ -7860,9 +7835,9 @@ RUN echo $RUBY_VERSION2
             desktop_source.display()
         );
         assert!(
-            host_destination.starts_with(host_artifact_root()),
+            host_destination.starts_with(&host_artifact_root()),
             "staging must land in the host features content directory; got {}",
-            host_destination.display()
+            host_destination
         );
     }
 
@@ -7896,8 +7871,8 @@ RUN echo $RUBY_VERSION2
         let copied = test_dependencies.host.copied_directories();
         assert_eq!(copied.len(), 1, "expected one host-side copy: {copied:?}");
         let (source, destination) = &copied[0];
-        assert!(source.starts_with(source_root()));
-        assert!(destination.starts_with(host_artifact_root()));
+        assert!(source.starts_with(&source_root()));
+        assert!(destination.starts_with(&host_artifact_root()));
         assert!(
             test_dependencies.host.staged_assets().is_empty(),
             "a feature that already lives on the host must not be staged from the desktop"
@@ -8009,7 +7984,10 @@ RUN echo $RUBY_VERSION2
         let dotenv = source_root().join(".env");
         test_dependencies
             .fs
-            .insert_file(&dotenv, b"COMPOSE_PROJECT_NAME=from-dotenv".to_vec())
+            .insert_file(
+                dotenv.to_path_buf(),
+                b"COMPOSE_PROJECT_NAME=from-dotenv".to_vec(),
+            )
             .await;
         test_dependencies.host.fail_read(dotenv);
         manifest.parse_nonremote_vars().unwrap();

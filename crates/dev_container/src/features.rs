@@ -1,5 +1,6 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::collections::HashMap;
 
+use remote::HostPathBuf;
 use serde::Deserialize;
 use serde_json_lenient::Value;
 
@@ -68,11 +69,11 @@ impl FeatureOptionDefinition {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Default)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct FeatureManifest {
     consecutive_id: String,
     user_feature_id: String,
-    file_path: PathBuf,
+    file_path: HostPathBuf,
     feature_json: DevContainerFeatureJson,
 }
 
@@ -80,7 +81,7 @@ impl FeatureManifest {
     pub(crate) fn new(
         consecutive_id: String,
         user_feature_id: String,
-        file_path: PathBuf,
+        file_path: HostPathBuf,
         feature_json: DevContainerFeatureJson,
     ) -> Self {
         Self {
@@ -220,7 +221,7 @@ RUN chmod -R 0755 {full_dest} \
         self.feature_json.security_opt.clone().unwrap_or_default()
     }
 
-    pub(crate) fn file_path(&self) -> PathBuf {
+    pub(crate) fn file_path(&self) -> HostPathBuf {
         self.file_path.clone()
     }
 

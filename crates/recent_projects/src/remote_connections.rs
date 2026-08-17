@@ -12,15 +12,15 @@ use gpui::{AppContext, AsyncApp, PromptLevel, WindowHandle};
 
 use project::trusted_worktrees;
 use remote::{
-    DockerConnectionOptions, HostDockerConnectionOptions, Interactive,
+    DockerConnectionOptions, HostDockerConnectionOptions, HostPathBuf, Interactive,
     ProjectHostConnectionOptions, RemoteConnection, RemoteConnectionOptions, SshConnectionOptions,
 };
 pub use settings::SshConnection;
 use settings::{
-    DevContainerConnection, DevContainerProjectHost, ExtendingVec, RegisterSetting, Settings,
-    WslConnection,
+    DevContainerConnection, DevContainerProjectHost, DevContainerProjectPathStyle, ExtendingVec,
+    RegisterSetting, Settings, WslConnection,
 };
-use util::paths::PathWithPosition;
+use util::paths::{PathStyle, PathWithPosition};
 use workspace::{
     AppState, MultiWorkspace, OpenOptions, SerializedWorkspaceLocation, Workspace,
     find_existing_workspace,
@@ -93,6 +93,11 @@ impl From<Connection> for RemoteConnectionOptions {
             Connection::Ssh(conn) => RemoteConnectionOptions::Ssh(conn.into()),
             Connection::Wsl(conn) => RemoteConnectionOptions::Wsl(conn.into()),
             Connection::DevContainer(conn) => {
+                let project_path_style = match conn.project_path_style {
+                    Some(DevContainerProjectPathStyle::Unix) => PathStyle::Unix,
+                    Some(DevContainerProjectPathStyle::Windows) => PathStyle::Windows,
+                    None => PathStyle::Unix,
+                };
                 let container = DockerConnectionOptions {
                     name: conn.name,
                     remote_user: conn.remote_user,
@@ -123,8 +128,11 @@ impl From<Connection> for RemoteConnectionOptions {
                     (Some(project_host), Some(project_root), Some(devcontainer_config)) => {
                         RemoteConnectionOptions::HostDocker(HostDockerConnectionOptions {
                             project_host,
-                            project_root: project_root.into(),
-                            devcontainer_config: devcontainer_config.into(),
+                            project_root: HostPathBuf::new(project_root, project_path_style),
+                            devcontainer_config: HostPathBuf::new(
+                                devcontainer_config,
+                                project_path_style,
+                            ),
                             container,
                         })
                     }
@@ -575,6 +583,7 @@ mod tests {
                 username: Some("zed".to_string()),
                 port: Some(2222),
             }),
+            project_path_style: Some(DevContainerProjectPathStyle::Unix),
             project_root: Some("/work/zed".to_string()),
             devcontainer_config: Some("/work/zed/.devcontainer/devcontainer.json".to_string()),
             ..Default::default()
@@ -586,10 +595,13 @@ mod tests {
             panic!("host-backed Dev Container must not reconstruct as a local Docker connection");
         };
 
-        assert_eq!(connection.project_root, PathBuf::from("/work/zed"));
+        assert_eq!(
+            connection.project_root,
+            HostPathBuf::new("/work/zed", PathStyle::Unix)
+        );
         assert_eq!(
             connection.devcontainer_config,
-            PathBuf::from("/work/zed/.devcontainer/devcontainer.json")
+            HostPathBuf::new("/work/zed/.devcontainer/devcontainer.json", PathStyle::Unix,)
         );
         assert!(connection.container.use_podman);
         assert_eq!(connection.container.remote_user, "vscode");

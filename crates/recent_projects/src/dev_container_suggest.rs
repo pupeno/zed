@@ -220,10 +220,10 @@ pub fn suggest_on_worktree_updated(
 mod tests {
     use super::*;
     use remote::{
-        DockerConnectionOptions, HostDockerConnectionOptions, ProjectHostConnectionOptions,
-        SshConnectionOptions, WslConnectionOptions,
+        DockerConnectionOptions, HostDockerConnectionOptions, HostPathBuf,
+        ProjectHostConnectionOptions, SshConnectionOptions, WslConnectionOptions,
     };
-    use std::path::PathBuf;
+    use util::paths::PathStyle;
 
     #[test]
     fn local_ssh_and_wsl_projects_are_offered_dev_containers() {
@@ -256,8 +256,11 @@ mod tests {
             Some(&RemoteConnectionOptions::HostDocker(
                 HostDockerConnectionOptions {
                     project_host: ProjectHostConnectionOptions::Ssh(SshConnectionOptions::default()),
-                    project_root: PathBuf::from("/project"),
-                    devcontainer_config: PathBuf::from("/project/.devcontainer/devcontainer.json"),
+                    project_root: HostPathBuf::new("/project", PathStyle::Unix),
+                    devcontainer_config: HostPathBuf::new(
+                        "/project/.devcontainer/devcontainer.json",
+                        PathStyle::Unix,
+                    ),
                     container: DockerConnectionOptions::default(),
                 }
             ))

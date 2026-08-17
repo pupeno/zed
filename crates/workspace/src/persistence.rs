@@ -4330,8 +4330,11 @@ mod tests {
                 distro_name: "Ubuntu".to_string(),
                 user: Some("zed".to_string()),
             }),
-            project_root: "/work/zed".into(),
-            devcontainer_config: "/work/zed/.devcontainer/devcontainer.json".into(),
+            project_root: remote::HostPathBuf::new("/work/zed", util::paths::PathStyle::Unix),
+            devcontainer_config: remote::HostPathBuf::new(
+                "/work/zed/.devcontainer/devcontainer.json",
+                util::paths::PathStyle::Unix,
+            ),
             container: DockerConnectionOptions {
                 name: "zed".to_string(),
                 container_id: "container-id".to_string(),

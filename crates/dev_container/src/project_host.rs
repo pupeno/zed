@@ -1,21 +1,32 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    process::Output,
-    sync::Arc,
-};
+use std::{collections::HashMap, path::Path, process::Output, sync::Arc};
 
 use anyhow::{Context as _, Result};
 use async_trait::async_trait;
 use gpui::AsyncApp;
-use remote::{HostProcessRequest, ProjectHost};
+use remote::{HostPathBuf, HostProcessRequest, ProjectHost, ProjectHostPlatform};
+use util::paths::PathStyle;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct HostCommand {
     program: String,
-    args: Vec<String>,
+    args: Vec<HostCommandArgument>,
     environment: HashMap<String, String>,
-    working_directory: Option<PathBuf>,
+    working_directory: Option<HostPathBuf>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum HostCommandArgument {
+    Text(String),
+    Path { prefix: String, path: HostPathBuf },
+}
+
+impl HostCommandArgument {
+    fn serialize(&self) -> String {
+        match self {
+            Self::Text(text) => text.clone(),
+            Self::Path { prefix, path } => format!("{prefix}{path}"),
+        }
+    }
 }
 
 impl HostCommand {
@@ -27,7 +38,7 @@ impl HostCommand {
     }
 
     pub(crate) fn arg(&mut self, arg: impl Into<String>) -> &mut Self {
-        self.args.push(arg.into());
+        self.args.push(HostCommandArgument::Text(arg.into()));
         self
     }
 
@@ -36,7 +47,26 @@ impl HostCommand {
         I: IntoIterator<Item = S>,
         S: Into<String>,
     {
-        self.args.extend(args.into_iter().map(Into::into));
+        self.args.extend(
+            args.into_iter()
+                .map(|argument| HostCommandArgument::Text(argument.into())),
+        );
+        self
+    }
+
+    pub(crate) fn path_arg(&mut self, path: HostPathBuf) -> &mut Self {
+        self.path_arg_with_prefix("", path)
+    }
+
+    pub(crate) fn path_arg_with_prefix(
+        &mut self,
+        prefix: impl Into<String>,
+        path: HostPathBuf,
+    ) -> &mut Self {
+        self.args.push(HostCommandArgument::Path {
+            prefix: prefix.into(),
+            path,
+        });
         self
     }
 
@@ -47,8 +77,8 @@ impl HostCommand {
 
     /// Overrides the working directory. Left unset, the command runs at the
     /// project host's active source root.
-    pub(crate) fn current_dir(&mut self, directory: impl Into<PathBuf>) -> &mut Self {
-        self.working_directory = Some(directory.into());
+    pub(crate) fn current_dir(&mut self, directory: HostPathBuf) -> &mut Self {
+        self.working_directory = Some(directory);
         self
     }
 
@@ -56,23 +86,26 @@ impl HostCommand {
         &self.program
     }
 
-    pub(crate) fn get_args(&self) -> &[String] {
-        &self.args
+    pub(crate) fn get_args(&self) -> Vec<String> {
+        self.args
+            .iter()
+            .map(HostCommandArgument::serialize)
+            .collect()
     }
 
     pub(crate) fn environment(&self) -> &HashMap<String, String> {
         &self.environment
     }
 
-    pub(crate) fn working_directory(&self) -> Option<&Path> {
-        self.working_directory.as_deref()
+    pub(crate) fn working_directory(&self) -> Option<&HostPathBuf> {
+        self.working_directory.as_ref()
     }
 
     /// The command as a single shell word list, used when the command has to be
     /// handed to a shell inside the created container rather than run on the host.
     pub(crate) fn to_shell_words(&self) -> Vec<String> {
         let mut words = vec![self.program.clone()];
-        words.extend(self.args.iter().cloned());
+        words.extend(self.get_args());
         words
     }
 }
@@ -83,36 +116,62 @@ impl HostCommand {
 pub(crate) trait ProjectHostCapability {
     /// The active source root. Host processes run here unless a command asks for
     /// a different working directory.
-    fn source_root(&self) -> &Path;
+    fn source_root(&self) -> &HostPathBuf;
+
+    /// The operating system family the project host runs. Host-shaped decisions
+    /// come from here rather than from the desktop's build target.
+    ///
+    /// The remaining `#[cfg(target_os = ...)]` predicates in the host-side Dev
+    /// Container path have not moved onto it yet.
+    #[allow(dead_code)]
+    fn platform(&self) -> ProjectHostPlatform;
+
+    fn path_style(&self) -> PathStyle {
+        self.source_root().path_style()
+    }
+
+    /// Reinterprets a [`Path`] that already holds project-host path text.
+    ///
+    /// The text is preserved; only its interpretation moves from the desktop's
+    /// rules to the host's. Paths that are built up rather than received should
+    /// be derived from [`Self::source_root`] instead, so that no desktop-side
+    /// joining happens on the way.
+    fn host_path(&self, path: &Path) -> HostPathBuf {
+        HostPathBuf::from_path(path, self.path_style())
+    }
 
     /// The temporary directory to put generated host artifacts under.
-    async fn temporary_root(&self) -> Result<PathBuf>;
+    async fn temporary_root(&self) -> Result<HostPathBuf>;
 
     /// Runs a non-interactive host process to completion and collects its output.
     async fn run(&self, command: &HostCommand) -> Result<Output, std::io::Error>;
 
-    async fn read_file(&self, path: &Path) -> Result<Vec<u8>>;
+    async fn read_file(&self, path: &HostPathBuf) -> Result<Vec<u8>>;
 
-    async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<()>;
+    async fn write_file(&self, path: &HostPathBuf, contents: &[u8]) -> Result<()>;
 
-    async fn create_dir_all(&self, path: &Path) -> Result<()>;
+    async fn create_dir_all(&self, path: &HostPathBuf) -> Result<()>;
 
-    async fn is_file(&self, path: &Path) -> Result<bool>;
+    async fn is_file(&self, path: &HostPathBuf) -> Result<bool>;
 
-    async fn is_dir(&self, path: &Path) -> Result<bool>;
+    async fn is_dir(&self, path: &HostPathBuf) -> Result<bool>;
 
     /// Copies a directory that already lives on the project host.
-    async fn copy_dir(&self, source: &Path, destination: &Path) -> Result<()>;
+    async fn copy_dir(&self, source: &HostPathBuf, destination: &HostPathBuf) -> Result<()>;
 
     /// Transfers a desktop-local asset directory onto the project host. One-way,
     /// and only for assets the desktop obtained itself (downloaded feature
     /// tarballs); host-side inputs are read from the host instead.
-    async fn stage_assets(&self, desktop_source: &Path, host_destination: &Path) -> Result<()>;
+    async fn stage_assets(
+        &self,
+        desktop_source: &Path,
+        host_destination: &HostPathBuf,
+    ) -> Result<()>;
 
-    async fn read_to_string(&self, path: &Path) -> Result<String> {
+    async fn read_to_string(&self, path: &HostPathBuf) -> Result<String> {
         let contents = self.read_file(path).await?;
         String::from_utf8(contents)
-            .with_context(|| format!("project host file {} was not valid UTF-8", path.display()))
+            .with_context(|| format!("project host file {path} was not valid UTF-8"))
     }
 }
 
@@ -129,9 +188,10 @@ impl RemoteProjectHost {
     fn request(&self, command: &HostCommand) -> HostProcessRequest {
         let working_directory = command
             .working_directory()
-            .unwrap_or_else(|| <Self as ProjectHostCapability>::source_root(self));
+            .unwrap_or_else(|| self.project_host.project_root())
+            .clone();
         HostProcessRequest::new(command.program(), working_directory)
-            .arguments(command.get_args().iter().cloned())
+            .arguments(command.get_args())
             .environment(
                 command
                     .environment()
@@ -143,11 +203,19 @@ impl RemoteProjectHost {
 
 #[async_trait(?Send)]
 impl ProjectHostCapability for RemoteProjectHost {
-    fn source_root(&self) -> &Path {
+    fn source_root(&self) -> &HostPathBuf {
         self.project_host.project_root()
     }
 
-    async fn temporary_root(&self) -> Result<PathBuf> {
+    fn platform(&self) -> ProjectHostPlatform {
+        self.project_host.platform()
+    }
+
+    fn path_style(&self) -> PathStyle {
+        self.project_host.path_style()
+    }
+
+    async fn temporary_root(&self) -> Result<HostPathBuf> {
         self.project_host.temporary_root().await
     }
 
@@ -164,34 +232,38 @@ impl ProjectHostCapability for RemoteProjectHost {
         })
     }
 
-    async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+    async fn read_file(&self, path: &HostPathBuf) -> Result<Vec<u8>> {
         self.project_host.read_file(path).await
     }
 
-    async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<()> {
+    async fn write_file(&self, path: &HostPathBuf, contents: &[u8]) -> Result<()> {
         self.project_host.write_file(path, contents).await
     }
 
-    async fn create_dir_all(&self, path: &Path) -> Result<()> {
+    async fn create_dir_all(&self, path: &HostPathBuf) -> Result<()> {
         self.project_host.create_dir_all(path).await
     }
 
-    async fn is_file(&self, path: &Path) -> Result<bool> {
+    async fn is_file(&self, path: &HostPathBuf) -> Result<bool> {
         self.project_host.is_file(path).await
     }
 
-    async fn is_dir(&self, path: &Path) -> Result<bool> {
+    async fn is_dir(&self, path: &HostPathBuf) -> Result<bool> {
         self.project_host.is_dir(path).await
     }
 
-    async fn copy_dir(&self, source: &Path, destination: &Path) -> Result<()> {
+    async fn copy_dir(&self, source: &HostPathBuf, destination: &HostPathBuf) -> Result<()> {
         self.project_host.copy_dir(source, destination).await
     }
 
-    async fn stage_assets(&self, desktop_source: &Path, host_destination: &Path) -> Result<()> {
+    async fn stage_assets(
+        &self,
+        desktop_source: &Path,
+        host_destination: &HostPathBuf,
+    ) -> Result<()> {
         let project_host = self.project_host.clone();
         let desktop_source = desktop_source.to_path_buf();
-        let host_destination = host_destination.to_path_buf();
+        let host_destination = host_destination.clone();
         self.app
             .update(|cx| project_host.stage_assets(desktop_source, host_destination, cx))
             .await
@@ -204,7 +276,10 @@ fn into_io_error(error: anyhow::Error) -> std::io::Error {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use std::sync::{Mutex, MutexGuard};
+    use std::{
+        path::PathBuf,
+        sync::{Mutex, MutexGuard},
+    };
 
     use fs::{FakeFs, Fs};
 
@@ -225,7 +300,7 @@ pub(crate) mod test_support {
         pub(crate) environment: HashMap<String, String>,
         /// Where the process ran. Resolved the way a project host resolves it:
         /// the command's own working directory, or the active source root.
-        pub(crate) working_directory: PathBuf,
+        pub(crate) working_directory: HostPathBuf,
     }
 
     impl RecordedHostCommand {
@@ -236,28 +311,55 @@ pub(crate) mod test_support {
 
     /// A project host that records everything routed through it and resolves
     /// filesystem operations against a [`FakeFs`] standing in for the host.
+    ///
+    /// Its path style and platform are chosen by the test, so a single desktop
+    /// build can drive a Linux-style host and a Windows-style host.
     pub(crate) struct RecordingProjectHost {
-        source_root: PathBuf,
-        temporary_root: PathBuf,
+        source_root: HostPathBuf,
+        temporary_root: HostPathBuf,
+        platform: ProjectHostPlatform,
         fs: Arc<FakeFs>,
         commands: Mutex<Vec<RecordedHostCommand>>,
-        staged: Mutex<Vec<(PathBuf, PathBuf)>>,
-        copied: Mutex<Vec<(PathBuf, PathBuf)>>,
+        staged: Mutex<Vec<(PathBuf, HostPathBuf)>>,
+        copied: Mutex<Vec<(HostPathBuf, HostPathBuf)>>,
         outcomes: Mutex<HashMap<String, Output>>,
         unstartable: Mutex<Vec<String>>,
-        unreadable: Mutex<Vec<PathBuf>>,
-        unqueryable: Mutex<Vec<PathBuf>>,
+        unreadable: Mutex<Vec<HostPathBuf>>,
+        unqueryable: Mutex<Vec<HostPathBuf>>,
     }
 
     impl RecordingProjectHost {
+        /// Creates a host whose path rules and platform are the desktop's, for
+        /// tests that stand in for a local project.
         pub(crate) fn new(
-            source_root: impl Into<PathBuf>,
-            temporary_root: impl Into<PathBuf>,
+            source_root: impl AsRef<Path>,
+            temporary_root: impl AsRef<Path>,
+            fs: Arc<FakeFs>,
+        ) -> Self {
+            Self::with_platform(
+                HostPathBuf::from_path(source_root, PathStyle::local()),
+                HostPathBuf::from_path(temporary_root, PathStyle::local()),
+                if cfg!(windows) {
+                    ProjectHostPlatform::Windows
+                } else if cfg!(target_os = "macos") {
+                    ProjectHostPlatform::MacOs
+                } else {
+                    ProjectHostPlatform::Linux
+                },
+                fs,
+            )
+        }
+
+        pub(crate) fn with_platform(
+            source_root: HostPathBuf,
+            temporary_root: HostPathBuf,
+            platform: ProjectHostPlatform,
             fs: Arc<FakeFs>,
         ) -> Self {
             Self {
-                source_root: source_root.into(),
-                temporary_root: temporary_root.into(),
+                source_root,
+                temporary_root,
+                platform,
                 fs,
                 commands: Mutex::new(Vec::new()),
                 staged: Mutex::new(Vec::new()),
@@ -280,11 +382,11 @@ pub(crate) mod test_support {
                 .collect()
         }
 
-        pub(crate) fn staged_assets(&self) -> Vec<(PathBuf, PathBuf)> {
+        pub(crate) fn staged_assets(&self) -> Vec<(PathBuf, HostPathBuf)> {
             lock(&self.staged).clone()
         }
 
-        pub(crate) fn copied_directories(&self) -> Vec<(PathBuf, PathBuf)> {
+        pub(crate) fn copied_directories(&self) -> Vec<(HostPathBuf, HostPathBuf)> {
             lock(&self.copied).clone()
         }
 
@@ -307,12 +409,12 @@ pub(crate) mod test_support {
 
         /// Makes a path that exists on the host fail to read, as a permission or
         /// transport failure does. Distinct from the path simply being absent.
-        pub(crate) fn fail_read(&self, path: impl Into<PathBuf>) {
-            lock(&self.unreadable).push(path.into());
+        pub(crate) fn fail_read(&self, path: HostPathBuf) {
+            lock(&self.unreadable).push(path);
         }
 
-        pub(crate) fn fail_path_query(&self, path: impl Into<PathBuf>) {
-            lock(&self.unqueryable).push(path.into());
+        pub(crate) fn fail_path_query(&self, path: HostPathBuf) {
+            lock(&self.unqueryable).push(path);
         }
 
         pub(crate) fn respond_with(&self, program: &str, stdout: &str) {
@@ -345,11 +447,15 @@ pub(crate) mod test_support {
 
     #[async_trait(?Send)]
     impl ProjectHostCapability for RecordingProjectHost {
-        fn source_root(&self) -> &Path {
+        fn source_root(&self) -> &HostPathBuf {
             &self.source_root
         }
 
-        async fn temporary_root(&self) -> Result<PathBuf> {
+        fn platform(&self) -> ProjectHostPlatform {
+            self.platform
+        }
+
+        async fn temporary_root(&self) -> Result<HostPathBuf> {
             Ok(self.temporary_root.clone())
         }
 
@@ -366,12 +472,12 @@ pub(crate) mod test_support {
 
             lock(&self.commands).push(RecordedHostCommand {
                 program: command.program().to_string(),
-                args: command.get_args().to_vec(),
+                args: command.get_args(),
                 environment: command.environment().clone(),
                 working_directory: command
                     .working_directory()
                     .unwrap_or(&self.source_root)
-                    .to_path_buf(),
+                    .clone(),
             });
 
             let outcome = lock(&self.outcomes)
@@ -388,52 +494,57 @@ pub(crate) mod test_support {
             }))
         }
 
-        async fn read_file(&self, path: &Path) -> Result<Vec<u8>> {
+        async fn read_file(&self, path: &HostPathBuf) -> Result<Vec<u8>> {
             if lock(&self.unreadable)
                 .iter()
                 .any(|unreadable| unreadable == path)
             {
-                anyhow::bail!("project host could not read {}", path.display());
+                anyhow::bail!("project host could not read {path}");
             }
-            self.fs.load_bytes(path).await
+            self.fs.load_bytes(&path.to_path_buf()).await
         }
 
-        async fn write_file(&self, path: &Path, contents: &[u8]) -> Result<()> {
-            self.fs.write(path, contents).await
+        async fn write_file(&self, path: &HostPathBuf, contents: &[u8]) -> Result<()> {
+            self.fs.write(&path.to_path_buf(), contents).await
         }
 
-        async fn create_dir_all(&self, path: &Path) -> Result<()> {
-            self.fs.create_dir(path).await
+        async fn create_dir_all(&self, path: &HostPathBuf) -> Result<()> {
+            self.fs.create_dir(&path.to_path_buf()).await
         }
 
-        async fn is_file(&self, path: &Path) -> Result<bool> {
+        async fn is_file(&self, path: &HostPathBuf) -> Result<bool> {
             if lock(&self.unqueryable)
                 .iter()
                 .any(|unqueryable| unqueryable == path)
             {
-                anyhow::bail!("project host could not query {}", path.display());
+                anyhow::bail!("project host could not query {path}");
             }
-            Ok(self.fs.is_file(path).await)
+            Ok(self.fs.is_file(&path.to_path_buf()).await)
         }
 
-        async fn is_dir(&self, path: &Path) -> Result<bool> {
+        async fn is_dir(&self, path: &HostPathBuf) -> Result<bool> {
             if lock(&self.unqueryable)
                 .iter()
                 .any(|unqueryable| unqueryable == path)
             {
-                anyhow::bail!("project host could not query {}", path.display());
+                anyhow::bail!("project host could not query {path}");
             }
-            Ok(self.fs.is_dir(path).await)
+            Ok(self.fs.is_dir(&path.to_path_buf()).await)
         }
 
-        async fn copy_dir(&self, source: &Path, destination: &Path) -> Result<()> {
-            lock(&self.copied).push((source.to_path_buf(), destination.to_path_buf()));
-            self.copy_within_host(source, destination).await
+        async fn copy_dir(&self, source: &HostPathBuf, destination: &HostPathBuf) -> Result<()> {
+            lock(&self.copied).push((source.clone(), destination.clone()));
+            self.copy_within_host(&source.to_path_buf(), &destination.to_path_buf())
+                .await
         }
 
-        async fn stage_assets(&self, desktop_source: &Path, host_destination: &Path) -> Result<()> {
-            lock(&self.staged).push((desktop_source.to_path_buf(), host_destination.to_path_buf()));
-            self.copy_within_host(desktop_source, host_destination)
+        async fn stage_assets(
+            &self,
+            desktop_source: &Path,
+            host_destination: &HostPathBuf,
+        ) -> Result<()> {
+            lock(&self.staged).push((desktop_source.to_path_buf(), host_destination.clone()));
+            self.copy_within_host(desktop_source, &host_destination.to_path_buf())
                 .await
         }
     }

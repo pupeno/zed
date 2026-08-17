@@ -97,8 +97,8 @@ impl From<&RemoteConnectionOptions> for RemoteConnectionIdentity {
                 project_host: Box::new(RemoteConnectionIdentity::from(
                     &options.project_host.remote_connection_options(),
                 )),
-                project_root: options.project_root.display().to_string(),
-                devcontainer_config: options.devcontainer_config.display().to_string(),
+                project_root: options.project_root.as_str().to_string(),
+                devcontainer_config: options.devcontainer_config.as_str().to_string(),
                 container_id: options.container.container_id.clone(),
                 name: options.container.name.clone(),
                 remote_user: options.container.remote_user.clone(),
@@ -132,9 +132,14 @@ mod tests {
 
     use super::*;
     use crate::{
-        DockerConnectionOptions, HostDockerConnectionOptions, ProjectHostConnectionOptions,
-        SshConnectionOptions, WslConnectionOptions,
+        DockerConnectionOptions, HostDockerConnectionOptions, HostPathBuf,
+        ProjectHostConnectionOptions, SshConnectionOptions, WslConnectionOptions,
     };
+    use util::paths::PathStyle;
+
+    fn host_path(path: &str) -> HostPathBuf {
+        HostPathBuf::new(path, PathStyle::Unix)
+    }
 
     #[test]
     fn ssh_identity_ignores_non_persisted_runtime_fields() {
@@ -233,8 +238,8 @@ mod tests {
                 port: Some(2222),
                 ..Default::default()
             }),
-            project_root: "/work/project".into(),
-            devcontainer_config: "/work/project/.devcontainer/devcontainer.json".into(),
+            project_root: host_path("/work/project"),
+            devcontainer_config: host_path("/work/project/.devcontainer/devcontainer.json"),
             container: container.clone(),
         });
         let right = RemoteConnectionOptions::HostDocker(HostDockerConnectionOptions {
@@ -244,8 +249,8 @@ mod tests {
                 port: Some(2222),
                 ..Default::default()
             }),
-            project_root: "/work/project".into(),
-            devcontainer_config: "/work/project/.devcontainer/devcontainer.json".into(),
+            project_root: host_path("/work/project"),
+            devcontainer_config: host_path("/work/project/.devcontainer/devcontainer.json"),
             container,
         });
 
@@ -258,8 +263,8 @@ mod tests {
                 port: Some(2222),
                 ..Default::default()
             }),
-            project_root: "/work/project".into(),
-            devcontainer_config: "/work/project/.devcontainer/devcontainer.json".into(),
+            project_root: host_path("/work/project"),
+            devcontainer_config: host_path("/work/project/.devcontainer/devcontainer.json"),
             container: DockerConnectionOptions {
                 name: "zed-dev".to_string(),
                 container_id: "container-123".to_string(),
@@ -275,8 +280,10 @@ mod tests {
                     port: Some(2222),
                     ..Default::default()
                 }),
-                project_root: "/work/other-project".into(),
-                devcontainer_config: "/work/other-project/.devcontainer/devcontainer.json".into(),
+                project_root: host_path("/work/other-project"),
+                devcontainer_config: host_path(
+                    "/work/other-project/.devcontainer/devcontainer.json",
+                ),
                 container: DockerConnectionOptions {
                     name: "zed-dev".to_string(),
                     container_id: "container-123".to_string(),

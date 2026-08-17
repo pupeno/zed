@@ -1278,8 +1278,18 @@ pub struct DevContainerConnection {
     pub extension_ids: Vec<String>,
     pub remote_env: BTreeMap<String, String>,
     pub project_host: Option<DevContainerProjectHost>,
+    pub project_path_style: Option<DevContainerProjectPathStyle>,
     pub project_root: Option<String>,
     pub devcontainer_config: Option<String>,
+}
+
+#[derive(
+    Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema, MergeFrom, Hash,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum DevContainerProjectPathStyle {
+    Unix,
+    Windows,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, JsonSchema, MergeFrom, Hash)]

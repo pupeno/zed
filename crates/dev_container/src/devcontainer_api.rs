@@ -10,8 +10,8 @@ use gpui::{AsyncWindowContext, Entity};
 use project::Worktree;
 use serde::Deserialize;
 use settings::{
-    DevContainerConnection, DevContainerProjectHost, infer_json_indent_size,
-    replace_value_in_json_text,
+    DevContainerConnection, DevContainerProjectHost, DevContainerProjectPathStyle,
+    infer_json_indent_size, replace_value_in_json_text,
 };
 use util::rel_path::RelPath;
 use walkdir::WalkDir;
@@ -290,9 +290,12 @@ pub async fn start_dev_container_with_config(
             }),
             _ => None,
         });
-    let devcontainer_config = project_host
+    let project_root = project_host
         .as_ref()
-        .map(|_| context.project_directory.join(&actual_config.config_path));
+        .map(|_| context.project_host.project_root().clone());
+    let devcontainer_config = project_root.as_ref().map(|project_root| {
+        project_root.join_relative_path(&actual_config.config_path, util::paths::PathStyle::local())
+    });
 
     match spawn_dev_container(
         &context,
@@ -326,11 +329,14 @@ pub async fn start_dev_container_with_config(
                 extension_ids,
                 remote_env: remote_env.into_iter().collect(),
                 project_host,
-                project_root: context
-                    .project_host
-                    .remote_connection_options()
-                    .map(|_| context.project_directory.display().to_string()),
-                devcontainer_config: devcontainer_config.map(|path| path.display().to_string()),
+                project_path_style: context.project_host.remote_connection_options().map(|_| {
+                    match context.project_host.path_style() {
+                        util::paths::PathStyle::Unix => DevContainerProjectPathStyle::Unix,
+                        util::paths::PathStyle::Windows => DevContainerProjectPathStyle::Windows,
+                    }
+                }),
+                project_root: project_root.map(|path| path.as_str().to_string()),
+                devcontainer_config: devcontainer_config.map(|path| path.as_str().to_string()),
             };
 
             Ok((connection, remote_workspace_folder))
@@ -534,14 +540,15 @@ mod tests {
             DevContainerConfig, DevContainerError, check_for_docker, find_configs_in_snapshot,
             is_supported_dev_container_source_connection,
         },
-        project_host::test_support::RecordingProjectHost,
+        project_host::{ProjectHostCapability, test_support::RecordingProjectHost},
     };
     use fs::FakeFs;
     use gpui::TestAppContext;
     use project::Project;
     use remote::{
-        DockerConnectionOptions, HostDockerConnectionOptions, ProjectHostConnectionOptions,
-        RemoteConnectionOptions, SshConnectionOptions, WslConnectionOptions,
+        DockerConnectionOptions, HostDockerConnectionOptions, HostPathBuf,
+        ProjectHostConnectionOptions, RemoteConnectionOptions, SshConnectionOptions,
+        WslConnectionOptions,
     };
     use serde_json::json;
     use settings::SettingsStore;
@@ -587,8 +594,11 @@ mod tests {
         assert!(!is_supported_dev_container_source_connection(
             &RemoteConnectionOptions::HostDocker(HostDockerConnectionOptions {
                 project_host: ProjectHostConnectionOptions::Ssh(SshConnectionOptions::default()),
-                project_root: PathBuf::from("/project"),
-                devcontainer_config: PathBuf::from("/project/.devcontainer/devcontainer.json"),
+                project_root: HostPathBuf::from_path("/project", util::paths::PathStyle::Unix),
+                devcontainer_config: HostPathBuf::from_path(
+                    "/project/.devcontainer/devcontainer.json",
+                    util::paths::PathStyle::Unix,
+                ),
                 container: DockerConnectionOptions::default(),
             })
         ));
@@ -605,7 +615,7 @@ mod tests {
         assert_eq!(probes[0].arguments(), vec!["--version"]);
         assert_eq!(
             probes[0].working_directory,
-            PathBuf::from(TEST_SOURCE_ROOT),
+            host.source_root().clone(),
             "the engine that builds the container is the project host's, so probe it there"
         );
     }

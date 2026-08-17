@@ -1,7 +1,8 @@
 use db::kvp::KeyValueStore;
-use dev_container::find_configs_in_snapshot;
+use dev_container::{find_configs_in_snapshot, is_supported_dev_container_source_connection};
 use gpui::{App, SharedString, Window};
 use project::{Project, WorktreeId};
+use remote::RemoteConnectionOptions;
 use std::path::Path;
 use std::sync::LazyLock;
 use ui::Tooltip;
@@ -69,6 +70,19 @@ fn dismiss_path_for_worktree(
     }
 }
 
+/// Whether a project is a source project a Dev Container can be started from.
+///
+/// Local, SSH, and WSL projects qualify. Docker and Podman projects do not: they
+/// are already the result of such a transition, so they are not offered one of
+/// their own. This deliberately does not test whether the worktree is local —
+/// SSH and WSL worktrees are remote and are still valid sources.
+fn is_supported_suggestion_source(
+    project_is_local: bool,
+    connection: Option<&RemoteConnectionOptions>,
+) -> bool {
+    project_is_local || connection.is_some_and(is_supported_dev_container_source_connection)
+}
+
 pub fn suggest_on_worktree_updated(
     workspace: &mut Workspace,
     worktree_id: WorktreeId,
@@ -93,7 +107,15 @@ pub fn suggest_on_worktree_updated(
 
     let worktree = worktree.read(cx);
 
-    if !worktree.is_local() {
+    let is_supported_source = {
+        let project = project.read(cx);
+        is_supported_suggestion_source(
+            project.is_local(),
+            project.remote_connection_options(cx).as_ref(),
+        )
+    };
+
+    if !is_supported_source {
         return;
     }
 
@@ -192,4 +214,53 @@ pub fn suggest_on_worktree_updated(
             })
         });
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use remote::{
+        DockerConnectionOptions, HostDockerConnectionOptions, ProjectHostConnectionOptions,
+        SshConnectionOptions, WslConnectionOptions,
+    };
+    use std::path::PathBuf;
+
+    #[test]
+    fn local_ssh_and_wsl_projects_are_offered_dev_containers() {
+        assert!(is_supported_suggestion_source(true, None));
+        assert!(is_supported_suggestion_source(
+            false,
+            Some(&RemoteConnectionOptions::Ssh(
+                SshConnectionOptions::default()
+            ))
+        ));
+        assert!(is_supported_suggestion_source(
+            false,
+            Some(&RemoteConnectionOptions::Wsl(WslConnectionOptions {
+                distro_name: "Ubuntu".to_string(),
+                user: None,
+            }))
+        ));
+    }
+
+    #[test]
+    fn container_projects_are_not_offered_dev_containers() {
+        assert!(!is_supported_suggestion_source(
+            false,
+            Some(&RemoteConnectionOptions::Docker(
+                DockerConnectionOptions::default()
+            ))
+        ));
+        assert!(!is_supported_suggestion_source(
+            false,
+            Some(&RemoteConnectionOptions::HostDocker(
+                HostDockerConnectionOptions {
+                    project_host: ProjectHostConnectionOptions::Ssh(SshConnectionOptions::default()),
+                    project_root: PathBuf::from("/project"),
+                    devcontainer_config: PathBuf::from("/project/.devcontainer/devcontainer.json"),
+                    container: DockerConnectionOptions::default(),
+                }
+            ))
+        ));
+    }
 }

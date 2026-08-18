@@ -2,7 +2,6 @@ use std::{
     collections::HashMap,
     fmt::Debug,
     hash::{DefaultHasher, Hash, Hasher},
-    path::PathBuf,
     rc::Rc,
     sync::Arc,
 };
@@ -16,7 +15,7 @@ use util::ResultExt;
 
 use crate::{
     DevContainerConfig, DevContainerContext,
-    devcontainer_api::{DevContainerError, DevContainerUp},
+    devcontainer_api::{DevContainerError, DevContainerUp, unix_base_name},
     devcontainer_json::{
         ContainerBuild, DevContainer, DevContainerBuildType, FeatureOptions, ForwardPort,
         MountDefinition, deserialize_devcontainer_json, deserialize_devcontainer_json_from_value,
@@ -50,7 +49,13 @@ pub(crate) struct DockerComposeResources {
 }
 
 struct DevContainerManifest {
+    /// Desktop-local: Zed's own HTTP client, holding the desktop's registry
+    /// credentials and proxy settings. Feature and template blobs are fetched by
+    /// the desktop before being staged onto the project host.
     http_client: Arc<dyn HttpClient>,
+    /// Desktop-local: the desktop filesystem, used only to unpack what
+    /// [`Self::http_client`] fetched into the desktop staging directory.
+    /// Everything the project host reads or writes goes through [`Self::host`].
     fs: Arc<dyn Fs>,
     host: Rc<dyn ProjectHostCapability>,
     docker_client: Rc<dyn DockerClient>,
@@ -74,7 +79,10 @@ impl DevContainerManifest {
         local_config: DevContainerConfig,
     ) -> Result<Self, DevContainerError> {
         let source_root = host.source_root().clone();
-        let config_path = source_root.join(local_config.config_path.to_string_lossy());
+        // `RelPath` is always `/`-separated, and `HostPathBuf::join` normalizes
+        // what it is given into the host's separators, so the configuration lands
+        // under the host root with the host's rules and never the desktop's.
+        let config_path = source_root.join(local_config.config_path.as_unix_str());
         log::debug!("parsing devcontainer json found in {config_path}");
         let devcontainer_contents = host.read_to_string(&config_path).await.map_err(|e| {
             log::error!("Unable to read devcontainer contents: {e}");
@@ -168,12 +176,15 @@ impl DevContainerManifest {
                         )
                         .replace(
                             "${containerWorkspaceFolder}",
-                            &self
-                                .remote_workspace_folder()
-                                .map(|path| path.display().to_string())
-                                .unwrap_or_default()
-                                .replace('\\', "/"),
+                            &self.remote_workspace_folder().unwrap_or_default(),
                         )
+                        // The separator rewrite is a fixed transformation, not a
+                        // desktop one: a Windows project host yields `C:/proj`
+                        // from every desktop, because the expanded value most
+                        // often reaches Docker as a bind-mount source. It is
+                        // inconsistent with `remote_workspace_mount`, which does
+                        // not rewrite; both are host-independent, so neither is a
+                        // desktop boundary leak.
                         .replace(
                             "${localWorkspaceFolder}",
                             &self.local_workspace_folder().replace('\\', "/"),
@@ -431,8 +442,11 @@ impl DevContainerManifest {
 
         let features_content_dir = temp_base.join(format!("container-features-{}", timestamp));
         let empty_context_dir = temp_base.join("empty-folder");
-        // Feature tarballs are fetched over HTTP by the desktop, so each one is
-        // unpacked here before being staged into `features_content_dir`.
+        // Desktop-local: feature tarballs are fetched over HTTP by the desktop,
+        // so each one is unpacked here before being staged into
+        // `features_content_dir` on the project host. The host never sees this
+        // directory, so it belongs in the desktop's temporary directory rather
+        // than the host temporary root.
         let desktop_staging_dir = std::env::temp_dir()
             .join("devcontainer-zed")
             .join(format!("staging-{}", timestamp));
@@ -1041,7 +1055,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
                 .and_then(|state| state.started_at.clone()),
             container_id: running_container.id,
             remote_user,
-            remote_workspace_folder: remote_workspace_folder.display().to_string(),
+            remote_workspace_folder,
             extension_ids: self.extension_ids(),
             remote_env,
         })
@@ -2075,27 +2089,25 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             .ok_or(DevContainerError::DevContainerParseFailed)
     }
 
-    fn remote_workspace_folder(&self) -> Result<PathBuf, DevContainerError> {
-        self.dev_container()
-            .workspace_folder
-            .as_ref()
-            .map(|folder| PathBuf::from(folder))
-            .or(Some(
-                // We explicitly use "/" here, instead of PathBuf::join
-                // because we want remote targets to use unix-style filepaths,
-                // even on a Windows host
-                PathBuf::from(format!(
-                    "{}/{}",
-                    DEFAULT_REMOTE_PROJECT_DIR,
-                    self.local_workspace_base_name()?
-                )),
-            ))
-            .ok_or(DevContainerError::DevContainerParseFailed)
+    /// The workspace folder as seen from inside the container.
+    ///
+    /// A plain `String` built with `/`: this path is resolved by the container,
+    /// not by the project host and not by the desktop, so neither machine's path
+    /// rules may touch it.
+    fn remote_workspace_folder(&self) -> Result<String, DevContainerError> {
+        match &self.dev_container().workspace_folder {
+            Some(folder) => Ok(folder.clone()),
+            None => Ok(format!(
+                "{}/{}",
+                DEFAULT_REMOTE_PROJECT_DIR,
+                self.local_workspace_base_name()?
+            )),
+        }
     }
     fn remote_workspace_base_name(&self) -> Result<String, DevContainerError> {
-        self.remote_workspace_folder().and_then(|f| {
-            f.file_name()
-                .map(|file_name| file_name.display().to_string())
+        self.remote_workspace_folder().and_then(|folder| {
+            unix_base_name(&folder)
+                .map(|name| name.to_string())
                 .ok_or(DevContainerError::DevContainerParseFailed)
         })
     }
@@ -2110,12 +2122,11 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
 
         Ok(MountDefinition {
             source: Some(self.local_workspace_folder()),
-            // We explicitly use "/" here, instead of PathBuf::join
-            // because we want the remote target to use unix-style filepaths,
-            // even on a Windows host
+            // The mount target is a path inside the container, so it is built
+            // with "/" rather than joined with any machine's path rules.
             target: format!(
                 "{}/{}",
-                PathBuf::from(DEFAULT_REMOTE_PROJECT_DIR).display(),
+                DEFAULT_REMOTE_PROJECT_DIR,
                 project_directory_name.to_string_lossy()
             ),
             mount_type: None,
@@ -2295,7 +2306,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
             log::error!("Config not yet parsed, cannot proceed with remote scripts");
             return Err(DevContainerError::DevContainerScriptsFailed);
         };
-        let remote_folder = self.remote_workspace_folder()?.display().to_string();
+        let remote_folder = self.remote_workspace_folder()?;
 
         if new_container {
             if let Some(on_create_command) = &config.on_create_command {
@@ -2447,7 +2458,7 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${PATH:-\3}/g' /etc/profile || true
                     .and_then(|state| state.started_at.clone()),
                 container_id: docker_ps.id,
                 remote_user: remote_user,
-                remote_workspace_folder: remote_folder.display().to_string(),
+                remote_workspace_folder: remote_folder,
                 extension_ids: self.extension_ids(),
                 remote_env,
             };
@@ -7683,7 +7694,7 @@ RUN echo $RUBY_VERSION2
                 Rc::new(FakeDocker::new()),
                 DevContainerConfig {
                     name: "default".to_string(),
-                    config_path: PathBuf::from(".devcontainer/devcontainer.json"),
+                    config_path: DevContainerConfig::default_config_path(),
                 },
             )
             .await?;

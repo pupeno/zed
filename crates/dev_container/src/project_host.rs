@@ -18,14 +18,14 @@ pub(crate) struct HostCommand {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum HostCommandArgument {
     Text(String),
-    Path { prefix: String, path: HostPathBuf },
+    HostPath { prefix: String, path: HostPathBuf },
 }
 
 impl HostCommandArgument {
     fn serialize(&self) -> String {
         match self {
             Self::Text(text) => text.clone(),
-            Self::Path { prefix, path } => format!("{prefix}{path}"),
+            Self::HostPath { prefix, path } => format!("{prefix}{path}"),
         }
     }
 }
@@ -64,7 +64,7 @@ impl HostCommand {
         prefix: impl Into<String>,
         path: HostPathBuf,
     ) -> &mut Self {
-        self.args.push(HostCommandArgument::Path {
+        self.args.push(HostCommandArgument::HostPath {
             prefix: prefix.into(),
             path,
         });
@@ -147,6 +147,8 @@ pub(crate) trait ProjectHostCapability {
     /// tarballs); host-side inputs are read from the host instead.
     async fn stage_assets(
         &self,
+        // Desktop-local: the one crossing of the boundary, so this side is a
+        // desktop `Path` by design and the destination is a host path.
         desktop_source: &Path,
         host_destination: &HostPathBuf,
     ) -> Result<()>;
@@ -237,6 +239,7 @@ impl ProjectHostCapability for RemoteProjectHost {
 
     async fn stage_assets(
         &self,
+        // Desktop-local: see the trait's declaration of this method.
         desktop_source: &Path,
         host_destination: &HostPathBuf,
     ) -> Result<()> {

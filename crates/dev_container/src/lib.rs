@@ -45,6 +45,9 @@ use workspace::{ModalView, Workspace, with_active_or_new_workspace};
 use http_client::HttpClient;
 
 mod command_json;
+/// Guards the desktop/project-host boundary. Test-only; see the module docs.
+#[cfg(test)]
+mod desktop_boundary;
 mod devcontainer_api;
 mod devcontainer_json;
 mod devcontainer_manifest;
@@ -99,14 +102,23 @@ fn get_safe_id(input: &str) -> String {
 }
 
 pub struct DevContainerContext {
+    /// The project's directory on the project host.
+    ///
+    /// Desktop-local type carrying a project-host value: `Path` is the shape
+    /// [`ProjectEnvironment::directory_environment`] and [`ProjectHost`] both
+    /// accept, and both reinterpret it with the project's own rules. Nothing may
+    /// join, normalize, or inspect it here — ask [`Self::project_host`] for a
+    /// host-semantic path instead.
     pub project_directory: Arc<Path>,
     pub project_host: Arc<ProjectHost>,
     pub use_podman: bool,
     pub use_buildkit: Option<bool>,
-    /// The desktop filesystem. Only used for assets the desktop obtains itself
-    /// before they are staged onto the project host; host-side inputs and
-    /// generated host artifacts go through [`DevContainerContext::host`].
+    /// Desktop-local: the desktop filesystem. Only used for assets the desktop
+    /// obtains itself before they are staged onto the project host; host-side
+    /// inputs and generated host artifacts go through [`Self::project_host`].
     pub fs: Arc<dyn Fs>,
+    /// Desktop-local: Zed's HTTP client, holding the desktop's registry
+    /// credentials and proxy settings.
     pub http_client: Arc<dyn HttpClient>,
     pub environment: WeakEntity<ProjectEnvironment>,
     app: gpui::AsyncApp,

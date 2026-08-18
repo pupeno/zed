@@ -46,7 +46,6 @@ use ui::{
 use util::{
     ResultExt,
     paths::{PathStyle, RemotePathBuf},
-    rel_path::RelPath,
 };
 use workspace::{
     AppState, DismissDecision, ModalView, MultiWorkspace, OpenLog, OpenOptions, Toast, Workspace,
@@ -240,7 +239,7 @@ impl PickerDelegate for DevContainerPickerDelegate {
             .filter(|c| {
                 c.name.to_lowercase().contains(&query_lower)
                     || c.config_path
-                        .to_string_lossy()
+                        .as_unix_str()
                         .to_lowercase()
                         .contains(&query_lower)
             })
@@ -295,7 +294,9 @@ impl PickerDelegate for DevContainerPickerDelegate {
         _cx: &mut Context<Picker<Self>>,
     ) -> Option<Self::ListItem> {
         let candidate = self.matching_candidates.get(ix)?;
-        let config_path = candidate.config_path.display().to_string();
+        // The configuration lives on the project host, so it is shown with the
+        // separators of the machine that owns it rather than the desktop's.
+        let config_path = candidate.config_path.display(PathStyle::Unix).to_string();
         Some(
             ListItem::new(SharedString::from(format!("li-devcontainer-config-{}", ix)))
                 .inset(true)
@@ -2159,7 +2160,7 @@ impl RemoteServerProjects {
 
         let config_path = config
             .map(|c| c.config_path)
-            .unwrap_or_else(|| PathBuf::from(".devcontainer/devcontainer.json"));
+            .unwrap_or_else(DevContainerConfig::default_config_path);
 
         workspace.update(cx, |workspace, cx| {
             let project = workspace.project().clone();
@@ -2171,18 +2172,7 @@ impl RemoteServerProjects {
 
             if let Some(worktree) = worktree {
                 let tree_id = worktree.read(cx).id();
-                let devcontainer_path =
-                    match RelPath::new(&config_path, util::paths::PathStyle::Unix) {
-                        Ok(path) => path.into_owned(),
-                        Err(error) => {
-                            log::error!(
-                                "Invalid devcontainer path: {} - {}",
-                                config_path.display(),
-                                error
-                            );
-                            return;
-                        }
-                    };
+                let devcontainer_path = config_path;
                 cx.spawn_in(window, async move |workspace, cx| {
                     workspace
                         .update_in(cx, |workspace, window, cx| {

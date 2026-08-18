@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
-    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -32,22 +31,35 @@ use crate::{
 pub struct DevContainerConfig {
     /// Display name for the configuration (subfolder name or "default")
     pub name: String,
-    /// Relative path to the devcontainer.json file from the project root
-    pub config_path: PathBuf,
+    /// Path to the devcontainer.json file, relative to the project root on the
+    /// project host. A [`RelPath`] rather than a [`PathBuf`] because the path
+    /// belongs to the project host: the desktop only carries it from the
+    /// worktree that discovered it to the host root it is resolved against, and
+    /// must not read its separators with its own rules on the way.
+    pub config_path: Arc<RelPath>,
 }
 
 impl DevContainerConfig {
+    /// The path a Dev Container configuration lives at when none was chosen.
+    pub fn default_config_path() -> Arc<RelPath> {
+        RelPath::from_unix_str(".devcontainer/devcontainer.json")
+            .expect("valid path")
+            .into_arc()
+    }
+
     pub fn default_config() -> Self {
         Self {
             name: "default".to_string(),
-            config_path: PathBuf::from(".devcontainer/devcontainer.json"),
+            config_path: Self::default_config_path(),
         }
     }
 
     pub fn root_config() -> Self {
         Self {
             name: "root".to_string(),
-            config_path: PathBuf::from(".devcontainer.json"),
+            config_path: RelPath::from_unix_str(".devcontainer.json")
+                .expect("valid path")
+                .into_arc(),
         }
     }
 }
@@ -222,7 +234,7 @@ pub fn find_configs_in_snapshot(snapshot: &Snapshot) -> Vec<DevContainerConfig> 
                             );
                             configs.push(DevContainerConfig {
                                 name: subfolder_name,
-                                config_path: PathBuf::from(&config_json_path),
+                                config_path: rel_config_path.into_arc(),
                             });
                         } else {
                             log::debug!(
@@ -295,7 +307,7 @@ pub async fn start_dev_container_with_config(
         .map(|_| context.project_host.project_root().clone());
     let devcontainer_config = project_root
         .as_ref()
-        .map(|project_root| project_root.join(actual_config.config_path.to_string_lossy()));
+        .map(|project_root| project_root.join(actual_config.config_path.as_unix_str()));
 
     match spawn_dev_container(&context, environment.clone(), actual_config.clone()).await {
         Ok(DevContainerUp {
@@ -403,6 +415,12 @@ pub(crate) async fn apply_devcontainer_template(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    // Desktop-local: the template tarball is fetched over HTTP by the desktop and
+    // unpacked with the desktop's filesystem and directory walker, so the project
+    // host never sees this directory. The extracted files reach the project host
+    // only through `worktree.create_entry` below, which writes wherever the
+    // project lives. Nothing here is a project-host path, so the host temporary
+    // root would be the wrong place for it.
     let extract_dir = std::env::temp_dir()
         .join(&template.id)
         .join(format!("extracted-{timestamp}"));
@@ -517,16 +535,28 @@ fn expand_template_options(content: String, template_options: &HashMap<String, S
 }
 
 fn get_backup_project_name(remote_workspace_folder: &str, container_id: &str) -> String {
-    Path::new(remote_workspace_folder)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|string| string.to_string())
+    // The workspace folder is a path inside the container, so its only separator
+    // is `/`. Splitting it with the desktop's rules would additionally break a
+    // Windows desktop on a backslash, which is an ordinary character in a
+    // container path.
+    unix_base_name(remote_workspace_folder)
+        .map(|name| name.to_string())
         .unwrap_or_else(|| container_id.to_string())
+}
+
+/// The last component of a `/`-separated path inside a container.
+pub(crate) fn unix_base_name(path: &str) -> Option<&str> {
+    let name = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    (!name.is_empty()).then_some(name)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::{path::PathBuf, rc::Rc};
+    use std::rc::Rc;
 
     use crate::{
         devcontainer_api::{
@@ -670,7 +700,7 @@ mod tests {
 
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].name, "root");
-        assert_eq!(configs[0].config_path, PathBuf::from(".devcontainer.json"));
+        assert_eq!(configs[0].config_path.as_unix_str(), ".devcontainer.json");
     }
 
     #[gpui::test]
@@ -860,11 +890,11 @@ mod tests {
 
         assert_eq!(configs.len(), 2);
         assert_eq!(configs[0].name, "root");
-        assert_eq!(configs[0].config_path, PathBuf::from(".devcontainer.json"));
+        assert_eq!(configs[0].config_path.as_unix_str(), ".devcontainer.json");
         assert_eq!(configs[1].name, "rust");
         assert_eq!(
-            configs[1].config_path,
-            PathBuf::from(".devcontainer/rust/devcontainer.json")
+            configs[1].config_path.as_unix_str(),
+            ".devcontainer/rust/devcontainer.json"
         );
     }
 

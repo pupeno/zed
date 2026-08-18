@@ -121,10 +121,6 @@ pub(crate) trait ProjectHostCapability {
 
     /// The operating system family the project host runs. Host-shaped decisions
     /// come from here rather than from the desktop's build target.
-    ///
-    /// The remaining `#[cfg(target_os = ...)]` predicates in the host-side Dev
-    /// Container path have not moved onto it yet.
-    #[allow(dead_code)]
     fn platform(&self) -> ProjectHostPlatform;
 
     /// The temporary directory to put generated host artifacts under.

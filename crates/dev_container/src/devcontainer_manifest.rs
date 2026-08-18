@@ -721,10 +721,10 @@ impl DevContainerManifest {
         dockerfile_content: String,
         use_buildkit: bool,
     ) -> String {
-        #[cfg(not(target_os = "windows"))]
-        let update_remote_user_uid = self.dev_container().update_remote_user_uid.unwrap_or(true);
-        #[cfg(target_os = "windows")]
-        let update_remote_user_uid = false;
+        // The remap layer, when there is one, carries the feature environment
+        // and `containerEnv` instead of this Dockerfile. Both sides ask
+        // `remaps_remote_user` so that they land in exactly one of the two.
+        let update_remote_user_uid = self.remaps_remote_user(remote_user);
         let feature_layers: String = self
             .features
             .iter()
@@ -1645,24 +1645,27 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
         Ok(image)
     }
 
-    #[cfg(target_os = "windows")]
-    fn should_update_remote_user_uid(
-        &self,
-        _image: &DockerInspect,
-    ) -> Result<bool, DevContainerError> {
-        Ok(false)
+    /// Whether the project host is a platform on which a host-native Zed remaps
+    /// the container user. The ids the container user is remapped onto belong to
+    /// the account that owns the bind-mounted checkout, so this is a question
+    /// about the project host, never about the desktop driving it.
+    fn host_remaps_container_user(&self) -> bool {
+        !self.host.platform().is_windows()
     }
 
-    #[cfg(target_os = "windows")]
-    async fn update_remote_user_uid(
-        &self,
-        image: DockerInspect,
-        _base_image: &str,
-    ) -> Result<DockerInspect, DevContainerError> {
-        Ok(image)
+    /// Whether `remote_user` gets remapped onto the project host's account.
+    ///
+    /// The sole predicate behind both halves of the decision, so that the
+    /// feature environment and `containerEnv` are emitted by exactly one of the
+    /// extended Dockerfile and the remap Dockerfile. Root and bare-numeric users
+    /// are already ids on the host, so there is nothing to remap for them.
+    fn remaps_remote_user(&self, remote_user: &str) -> bool {
+        self.host_remaps_container_user()
+            && self.dev_container().update_remote_user_uid != Some(false)
+            && remote_user != "root"
+            && !remote_user.chars().all(|c| c.is_ascii_digit())
     }
 
-    #[cfg(not(target_os = "windows"))]
     fn should_update_remote_user_uid(
         &self,
         image: &DockerInspect,
@@ -1670,14 +1673,12 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
         if self.features_build_info.is_none() {
             return Ok(false);
         }
-        if self.dev_container().update_remote_user_uid == Some(false) {
-            return Ok(false);
-        }
+        // The extended Dockerfile asked the same question of the base image's
+        // remote user, before this image existed to be inspected.
         let remote_user = get_remote_user_from_config(image, self)?;
-        Ok(remote_user != "root" && !remote_user.chars().all(|c| c.is_ascii_digit()))
+        Ok(self.remaps_remote_user(&remote_user))
     }
 
-    #[cfg(not(target_os = "windows"))]
     async fn host_id(&self, flag: &str) -> Result<u32, DevContainerError> {
         let described = format!("id {flag}");
         let mut command = HostCommand::new("id");
@@ -1697,7 +1698,6 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
             })
     }
 
-    #[cfg(not(target_os = "windows"))]
     async fn update_remote_user_uid(
         &self,
         image: DockerInspect,
@@ -1775,7 +1775,6 @@ RUN sed -i -E 's/((^|\s)PATH=)([^\$]*)$/\1\${{PATH:-\3}}/g' /etc/profile || true
         self.docker_client.inspect(&updated_image_tag).await
     }
 
-    #[cfg(not(target_os = "windows"))]
     fn generate_update_uid_dockerfile(&self) -> String {
         let mut dockerfile = r#"ARG BASE_IMAGE
 FROM $BASE_IMAGE
@@ -3426,7 +3425,7 @@ mod test {
         ProjectEnvironment,
         worktree_store::{WorktreeIdCounter, WorktreeStore},
     };
-    use remote::HostPathBuf;
+    use remote::{HostPathBuf, ProjectHostPlatform};
     use serde_json_lenient::Value;
     use util::paths::{PathStyle, SanitizedPath};
 
@@ -3436,9 +3435,10 @@ mod test {
         devcontainer_json::MountDefinition,
         devcontainer_manifest::{
             ConfigStatus, DevContainerManifest, DockerBuildResources, DockerComposeResources,
-            DockerInspect, dockerfile_inject_alias, escape_compose_interpolation,
-            extract_feature_id, find_primary_service, get_remote_user_from_config,
-            image_from_dockerfile, is_local_feature_ref, resolve_compose_dockerfile,
+            DockerInspect, FeaturesBuildInfo, dockerfile_inject_alias,
+            escape_compose_interpolation, extract_feature_id, find_primary_service,
+            get_remote_user_from_config, image_from_dockerfile, is_local_feature_ref,
+            resolve_compose_dockerfile,
         },
         docker::{
             DockerClient, DockerComposeConfig, DockerComposeService, DockerComposeServiceBuild,
@@ -4439,8 +4439,11 @@ mod test {
         );
     }
 
-    // updateRemoteUserUID is treated as false in Windows, so this test will fail
-    // It is covered by test_spawns_devcontainer_with_dockerfile_and_no_update_uid
+    // The default test project host is the desktop, so on a Windows build it
+    // reports Windows and no remap happens. The remap decision itself is driven
+    // from both platforms by container_user_is_remapped_for_a_linux_project_host
+    // and its Windows counterpart; the rest of this flow is covered by
+    // test_spawns_devcontainer_with_dockerfile_and_no_update_uid.
     #[cfg(not(target_os = "windows"))]
     #[gpui::test]
     async fn test_spawns_devcontainer_with_dockerfile_and_features(cx: &mut TestAppContext) {
@@ -4822,8 +4825,9 @@ chmod +x ./install.sh
         }))
     }
 
-    // updateRemoteUserUID is treated as false in Windows, so this test will fail
-    // It is covered by test_spawns_devcontainer_with_docker_compose_and_no_update_uid
+    // The default test project host is the desktop, so on a Windows build it
+    // reports Windows and no remap happens. The rest of this flow is covered by
+    // test_spawns_devcontainer_with_docker_compose_and_no_update_uid.
     #[cfg(not(target_os = "windows"))]
     #[gpui::test]
     async fn test_spawns_devcontainer_with_docker_compose(cx: &mut TestAppContext) {
@@ -7746,6 +7750,201 @@ RUN echo $RUBY_VERSION2
         }
         .await;
         assert!(result.is_ok(), "remote startup failed: {result:?}");
+    }
+
+    /// What one project host's platform produces on both sides of the remap
+    /// decision: whether the container user is remapped, what the remap build
+    /// was asked to do, and which Dockerfile carries the feature environment
+    /// and `containerEnv`.
+    struct RemapOutcome {
+        should_remap: bool,
+        host_commands: Vec<RecordedHostCommand>,
+        extended_dockerfile: String,
+        /// A root remote user is already an id on the host, so no remap layer is
+        /// built for it on any platform and this Dockerfile has to carry the
+        /// environment itself.
+        extended_dockerfile_for_root_remote_user: String,
+        update_uid_dockerfile: String,
+    }
+
+    impl RemapOutcome {
+        fn remap_build_arguments(&self) -> Vec<&str> {
+            self.host_commands
+                .iter()
+                .filter(|command| command.args.first().map(String::as_str) == Some("build"))
+                .flat_map(|command| command.args.iter().map(String::as_str))
+                .collect()
+        }
+
+        fn queried_host_ids(&self) -> bool {
+            self.host_commands
+                .iter()
+                .any(|command| command.program == "id")
+        }
+    }
+
+    /// Drives the remap decision for a project host that reports `platform` and
+    /// owns `host_root` under that platform's own path rules.
+    ///
+    /// The manifest is read through the default project host and only then
+    /// handed the host under test, because `FakeFs` resolves a host path with
+    /// the desktop's rules, so a Windows-style tree cannot be served from a Unix
+    /// desktop. Nothing on the decision path reads the host filesystem, and a
+    /// host that does not remap never writes to it either, so both platforms run
+    /// from whichever desktop the suite is built for.
+    async fn remap_outcome_for_project_host(
+        cx: &mut TestAppContext,
+        platform: ProjectHostPlatform,
+        host_root: HostPathBuf,
+    ) -> RemapOutcome {
+        let (test_dependencies, mut manifest) = init_default_devcontainer_manifest(
+            cx,
+            r#"{
+                "name": "cli-remap",
+                "image": "test_image:latest",
+                "containerEnv": { "REMAP_MARKER": "carried-once" }
+            }"#,
+        )
+        .await
+        .expect("the manifest is read through the default project host");
+        manifest
+            .parse_nonremote_vars()
+            .expect("the configuration parses");
+
+        let features_content_dir = host_root.join("features");
+        let host = Rc::new(RecordingProjectHost::with_platform(
+            host_root.clone(),
+            host_root.clone(),
+            platform,
+            test_dependencies.fs.clone(),
+        ));
+        // The ids the container user is remapped onto belong to the project
+        // host's account, so a value the desktop could not have supplied proves
+        // where they came from.
+        host.respond_with("id", "4242\n");
+        if platform != ProjectHostPlatform::Windows {
+            test_dependencies
+                .fs
+                .insert_tree(features_content_dir.to_path_buf(), serde_json::json!({}))
+                .await;
+        }
+
+        manifest.host = host.clone();
+        manifest.features_build_info = Some(FeaturesBuildInfo {
+            dockerfile_path: features_content_dir.join("Dockerfile.extended"),
+            features_content_dir: features_content_dir.clone(),
+            empty_context_dir: host_root.join("empty"),
+            build_image: Some("test_image:latest".to_string()),
+            image_tag: "cli_remap-features".to_string(),
+        });
+
+        let image = test_dependencies
+            .docker
+            .inspect(&"test_image:latest".to_string())
+            .await
+            .expect("the fake registry knows the base image");
+        let should_remap = manifest
+            .should_update_remote_user_uid(&image)
+            .expect("the remap decision is available");
+        manifest
+            .update_remote_user_uid(image, "test_image:latest")
+            .await
+            .expect("the remap build either runs or is skipped");
+
+        RemapOutcome {
+            should_remap,
+            host_commands: host.commands(),
+            extended_dockerfile: manifest.generate_dockerfile_extended(
+                "root",
+                "node",
+                String::new(),
+                true,
+            ),
+            extended_dockerfile_for_root_remote_user: manifest.generate_dockerfile_extended(
+                "root",
+                "root",
+                String::new(),
+                true,
+            ),
+            update_uid_dockerfile: manifest.generate_update_uid_dockerfile(),
+        }
+    }
+
+    #[gpui::test]
+    async fn container_user_is_remapped_for_a_linux_project_host(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let outcome = remap_outcome_for_project_host(
+            cx,
+            ProjectHostPlatform::Linux,
+            unix_path("/home/zed/devcontainer"),
+        )
+        .await;
+
+        assert!(
+            outcome.should_remap,
+            "a Linux project host remaps the container user whatever the desktop is"
+        );
+        assert!(
+            outcome.queried_host_ids(),
+            "the ids remapped onto must be read from the project host"
+        );
+        let arguments = outcome.remap_build_arguments();
+        for expected in [
+            "BASE_IMAGE=test_image:latest",
+            "REMOTE_USER=node",
+            "NEW_UID=4242",
+            "NEW_GID=4242",
+            "IMAGE_USER=root",
+        ] {
+            assert!(
+                arguments.contains(&expected),
+                "the remap build must receive {expected}; recorded: {arguments:?}"
+            );
+        }
+        assert!(
+            outcome.update_uid_dockerfile.contains("ENV REMAP_MARKER="),
+            "the remap layer carries `containerEnv`"
+        );
+        assert!(
+            !outcome.extended_dockerfile.contains("ENV REMAP_MARKER="),
+            "the extended Dockerfile must not repeat the `containerEnv` the remap layer carries"
+        );
+        assert!(
+            outcome
+                .extended_dockerfile_for_root_remote_user
+                .contains("ENV REMAP_MARKER="),
+            "a remote user that is not remapped gets no remap layer, so the extended \
+             Dockerfile must carry `containerEnv` rather than drop it"
+        );
+    }
+
+    #[gpui::test]
+    async fn container_user_is_not_remapped_for_a_windows_project_host(cx: &mut TestAppContext) {
+        cx.executor().allow_parking();
+        let outcome = remap_outcome_for_project_host(
+            cx,
+            ProjectHostPlatform::Windows,
+            HostPathBuf::new(r"C:\Users\zed\devcontainer", PathStyle::Windows),
+        )
+        .await;
+
+        assert!(
+            !outcome.should_remap,
+            "a Windows project host has no account ids to remap onto, whatever the desktop is"
+        );
+        assert!(
+            !outcome.queried_host_ids(),
+            "a host that does not remap is never asked for account ids"
+        );
+        assert!(
+            outcome.remap_build_arguments().is_empty(),
+            "no remap build runs; recorded: {:?}",
+            outcome.host_commands
+        );
+        assert!(
+            outcome.extended_dockerfile.contains("ENV REMAP_MARKER="),
+            "with no remap layer, the extended Dockerfile carries `containerEnv`"
+        );
     }
 
     #[gpui::test]

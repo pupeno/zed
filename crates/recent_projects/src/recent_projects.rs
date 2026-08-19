@@ -550,16 +550,25 @@ pub fn init(cx: &mut App) {
         });
     });
 
-    // Subscribe to worktree additions to suggest opening the project in a dev container
+    // Suggest opening the project in a dev container, both for what it already
+    // contains and for anything that arrives later.
     cx.observe_new(
         |workspace: &mut Workspace, window: Option<&mut Window>, cx: &mut Context<Workspace>| {
             let Some(window) = window else {
                 return;
             };
+
+            let offered = dev_container_suggest::OfferedWorktrees::default();
+
+            // A project's entries are often all delivered before the workspace
+            // that would observe them exists, so ask what the project holds now
+            // rather than relying on a change event that may already be past.
+            dev_container_suggest::suggest_for_project_state(workspace, &offered, window, cx);
+
             cx.subscribe_in(
                 workspace.project(),
                 window,
-                move |workspace, project, event, window, cx| {
+                move |workspace, _project, event, window, cx| {
                     if let project::Event::WorktreeUpdatedEntries(worktree_id, updated_entries) =
                         event
                     {
@@ -567,7 +576,7 @@ pub fn init(cx: &mut App) {
                             workspace,
                             *worktree_id,
                             updated_entries,
-                            project,
+                            &offered,
                             window,
                             cx,
                         );

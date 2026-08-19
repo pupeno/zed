@@ -199,7 +199,7 @@ pub fn find_devcontainer_configs(workspace: &Workspace, cx: &gpui::App) -> Vec<D
 pub fn find_configs_in_snapshot(snapshot: &Snapshot) -> Vec<DevContainerConfig> {
     let mut configs = Vec::new();
 
-    let devcontainer_dir_path = RelPath::from_unix_str(".devcontainer").expect("valid path");
+    let devcontainer_dir_path = paths::local_dev_container_folder_path();
 
     if let Some(devcontainer_entry) = snapshot.entry_for_path(devcontainer_dir_path) {
         if devcontainer_entry.is_dir() {
@@ -575,7 +575,7 @@ mod tests {
     };
     use serde_json::json;
     use settings::SettingsStore;
-    use util::path;
+    use util::{path, rel_path::RelPath};
 
     const TEST_SOURCE_ROOT: &str = "/path/to/source/project";
 
@@ -896,6 +896,191 @@ mod tests {
             configs[1].config_path.as_unix_str(),
             ".devcontainer/rust/devcontainer.json"
         );
+    }
+
+    /// The reported case: a project deliberately parked inside a directory an
+    /// enclosing repository ignores. Every entry under the worktree root is
+    /// then marked ignored, and ignored directories are not loaded, so
+    /// `.devcontainer` used to stay an unloaded directory with no children and
+    /// the project was silently treated as having no configuration.
+    #[gpui::test]
+    async fn test_find_configs_when_an_enclosing_repository_ignores_the_project(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/enclosing"),
+            json!({
+                ".git": {},
+                ".gitignore": "ignored-tree\n",
+                "ignored-tree": {
+                    "project": {
+                        ".devcontainer": {
+                            "devcontainer.json": "{}"
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let project =
+            Project::test(fs, [path!("/enclosing/ignored-tree/project").as_ref()], cx).await;
+        cx.run_until_parked();
+
+        let configs = project.read_with(cx, |project, cx| {
+            let worktree = project
+                .visible_worktrees(cx)
+                .next()
+                .expect("should have a worktree");
+            find_configs_in_snapshot(worktree.read(cx))
+        });
+
+        assert_eq!(configs, vec![DevContainerConfig::default_config()]);
+    }
+
+    /// Named configurations live one level below `.devcontainer`, so reaching
+    /// them under an ignoring parent means loading that subdirectory too.
+    #[gpui::test]
+    async fn test_find_configs_subfolder_when_an_enclosing_repository_ignores_the_project(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/enclosing"),
+            json!({
+                ".git": {},
+                ".gitignore": "ignored-tree\n",
+                "ignored-tree": {
+                    "project": {
+                        ".devcontainer": {
+                            "devcontainer.json": "{}",
+                            "gpu": {
+                                "devcontainer.json": "{}"
+                            }
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let project =
+            Project::test(fs, [path!("/enclosing/ignored-tree/project").as_ref()], cx).await;
+        cx.run_until_parked();
+
+        let configs = project.read_with(cx, |project, cx| {
+            let worktree = project
+                .visible_worktrees(cx)
+                .next()
+                .expect("should have a worktree");
+            find_configs_in_snapshot(worktree.read(cx))
+        });
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].name, "default");
+        assert_eq!(configs[1].name, "gpu");
+        assert_eq!(
+            configs[1].config_path.as_unix_str(),
+            ".devcontainer/gpu/devcontainer.json"
+        );
+    }
+
+    /// Reaching into `.devcontainer` must not turn into reaching into the whole
+    /// ignored tree: the cost of finding a configuration stays proportional to
+    /// the configuration, not to the project.
+    #[gpui::test]
+    async fn test_find_configs_under_an_ignoring_repository_does_not_scan_the_rest(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/enclosing"),
+            json!({
+                ".git": {},
+                ".gitignore": "ignored-tree\n",
+                "ignored-tree": {
+                    "project": {
+                        ".devcontainer": {
+                            "devcontainer.json": "{}"
+                        },
+                        "node_modules": {
+                            "some-package": {
+                                "index.js": "module.exports = {};"
+                            }
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let project =
+            Project::test(fs, [path!("/enclosing/ignored-tree/project").as_ref()], cx).await;
+        cx.run_until_parked();
+
+        project.read_with(cx, |project, cx| {
+            let worktree = project
+                .visible_worktrees(cx)
+                .next()
+                .expect("should have a worktree");
+            let snapshot = worktree.read(cx);
+
+            assert_eq!(
+                find_configs_in_snapshot(snapshot),
+                vec![DevContainerConfig::default_config()]
+            );
+
+            let deep_path =
+                RelPath::from_unix_str("node_modules/some-package/index.js").expect("valid path");
+            assert!(
+                snapshot.entry_for_path(deep_path).is_none(),
+                "the rest of the ignored tree should still be deferred"
+            );
+        });
+    }
+
+    /// The project's own `.gitignore` excluding `.devcontainer` reaches the same
+    /// scan-deferral gate as an enclosing repository ignoring the whole project,
+    /// so it must not hide the configuration either.
+    #[gpui::test]
+    async fn test_find_configs_when_the_project_ignores_its_own_devcontainer_dir(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                ".gitignore": ".devcontainer\n",
+                ".devcontainer": {
+                    "devcontainer.json": "{}",
+                    "gpu": {
+                        "devcontainer.json": "{}"
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        cx.run_until_parked();
+
+        let configs = project.read_with(cx, |project, cx| {
+            let worktree = project
+                .visible_worktrees(cx)
+                .next()
+                .expect("should have a worktree");
+            find_configs_in_snapshot(worktree.read(cx))
+        });
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].name, "default");
+        assert_eq!(configs[1].name, "gpu");
     }
 
     #[gpui::test]

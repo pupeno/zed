@@ -2195,6 +2195,49 @@ impl RemoteServerProjects {
         cx.notify();
     }
 
+    /// Ends the creation phase of a Dev Container startup, leaving the task
+    /// that ran it free to go on opening the project without this modal.
+    ///
+    /// While a container is being created this modal owns that work twice
+    /// over: it refuses dismissal, so the container cannot be closed out from
+    /// under, and it owns the startup task, so abandoning the modal cancels
+    /// it. Neither may survive creation. What follows is the connection, and
+    /// [`open_remote_project`] makes it by putting its own modal where this
+    /// one is — which a modal that refuses dismissal silently defeats, and
+    /// which dismissing a modal that still owns the task would cancel.
+    ///
+    /// [`open_remote_project`]: crate::remote_connections::open_remote_project
+    pub(crate) fn dev_container_creation_finished(&mut self) {
+        self.allow_dismissal = true;
+        if let Mode::CreateRemoteDevContainer(state) = &mut self.mode
+            && let Some(creating) = state._creating.take()
+        {
+            // Detached rather than dropped: this is the very task that is
+            // running, and it has the connection still to make.
+            creating.detach();
+        }
+    }
+
+    /// The Dev Container startup state this modal is showing, for tests that
+    /// need to tell "started and still running" apart from "never started".
+    #[cfg(test)]
+    pub(crate) fn dev_container_progress(&self) -> Option<String> {
+        match &self.mode {
+            Mode::CreateRemoteDevContainer(state) => Some(match &state.progress {
+                DevContainerCreationProgress::SelectingConfig => "selecting-config".to_string(),
+                DevContainerCreationProgress::Creating => {
+                    if state._creating.is_some() {
+                        "creating".to_string()
+                    } else {
+                        "creating-without-task".to_string()
+                    }
+                }
+                DevContainerCreationProgress::Error(message) => format!("error: {message}"),
+            }),
+            _ => None,
+        }
+    }
+
     fn init_dev_container_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let configs = self
             .workspace
@@ -2278,7 +2321,15 @@ impl RemoteServerProjects {
             })
             .log_err();
 
+            entity
+                .update(cx, |this, cx| {
+                    this.dev_container_creation_finished();
+                    cx.emit(DismissEvent);
+                })
+                .log_err();
+
             let Some(app_state) = app_state.upgrade() else {
+                log::error!("Dev Container started but the app was shutting down; not opening it");
                 return;
             };
             let result = open_remote_project(
@@ -2303,12 +2354,6 @@ impl RemoteServerProjects {
                 .await
                 .ok();
             }
-            entity
-                .update(cx, |this, cx| {
-                    this.allow_dismissal = true;
-                    cx.emit(DismissEvent);
-                })
-                .log_err();
         });
         self.view_in_progress_dev_container(creating, window, cx);
     }
@@ -3249,6 +3294,51 @@ mod remote_server_projects_tests {
         assert!(
             startup_task_dropped.load(Ordering::SeqCst),
             "cancelling Dev Container creation must cancel the pending startup task"
+        );
+    }
+
+    /// The other side of the same task ownership: once the container exists,
+    /// the startup task goes on to connect to it, and the modal has to step
+    /// out of the way so the connection can have the modal layer. Dismissing
+    /// it must no longer take the task with it.
+    #[gpui::test]
+    async fn dismissing_after_creation_leaves_the_startup_task_running(cx: &mut TestAppContext) {
+        struct StartupTaskDropGuard(Arc<AtomicBool>);
+
+        impl Drop for StartupTaskDropGuard {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let app_state = init_test(cx);
+        let fs: Arc<dyn Fs> = app_state.fs.clone();
+        let project = Project::test(fs.clone(), [], cx).await;
+        let (workspace, cx) =
+            cx.add_window_view(|window, cx| Workspace::test_new(project, window, cx));
+        let modal = workspace.update_in(cx, |_workspace, window, cx| {
+            let workspace = cx.weak_entity();
+            cx.new(|cx| RemoteServerProjects::new(false, fs.clone(), window, workspace, cx))
+        });
+        let startup_task_dropped = Arc::new(AtomicBool::new(false));
+
+        modal.update_in(cx, |modal, window, cx| {
+            let drop_guard = StartupTaskDropGuard(startup_task_dropped.clone());
+            let creating = cx.spawn(async move |_, _| {
+                let _drop_guard = drop_guard;
+                futures::future::pending::<()>().await;
+            });
+            modal.view_in_progress_dev_container(creating, window, cx);
+
+            modal.dev_container_creation_finished();
+            modal.cancel(&menu::Cancel, window, cx);
+        });
+
+        cx.run_until_parked();
+        assert!(
+            !startup_task_dropped.load(Ordering::SeqCst),
+            "once the container is created the startup task has the connection still to make, \
+             and must outlive the modal rather than be cancelled with it"
         );
     }
 }

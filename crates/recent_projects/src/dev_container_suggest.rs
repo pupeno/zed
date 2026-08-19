@@ -723,6 +723,117 @@ mod tests {
         );
     }
 
+    /// Accepting the offer must actually start the container. The reporter sees
+    /// the offer, accepts it, and nothing at all happens afterwards — no
+    /// container, no error — so this drives the accept and asks the modal what
+    /// it is doing.
+    #[gpui::test]
+    async fn accepting_the_offer_starts_the_dev_container(cx: &mut TestAppContext) {
+        let app_state = init_test(cx);
+        let workspace =
+            open_local_project(path!("/accepting"), smoke_test_project(), &app_state, cx).await;
+
+        assert!(
+            suggestion_is_shown(&workspace, cx),
+            "the offer has to be made before it can be accepted"
+        );
+
+        let window = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        cx.dispatch_action(*window, zed_actions::OpenDevContainer);
+        deliver_next_frame(cx);
+
+        let progress = workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<crate::remote_servers::RemoteServerProjects>(cx)
+                .map(|modal| modal.read(cx).dev_container_progress())
+        });
+
+        assert_eq!(
+            progress,
+            Some(Some("creating".to_string())),
+            "accepting the offer should leave the modal creating the container"
+        );
+    }
+
+    /// The regression test for the reported defect: the container is created and
+    /// then nothing opens, with no error anywhere.
+    ///
+    /// Once the container exists, [`open_remote_project`] connects to it by
+    /// taking over the workspace's modal layer — it hides whatever is showing
+    /// and puts a `RemoteConnectionModal` in its place, then reads that modal
+    /// back to build the connection delegate. The Dev Container modal is the
+    /// thing showing, and it refuses dismissal for the whole of startup, so the
+    /// handoff silently produced no delegate and the connection was abandoned.
+    ///
+    /// This drives the same handoff against a modal in the state the reporter's
+    /// was in.
+    ///
+    /// [`open_remote_project`]: crate::remote_connections::open_remote_project
+    #[gpui::test]
+    async fn the_container_connection_can_take_over_from_the_dev_container_modal(
+        cx: &mut TestAppContext,
+    ) {
+        let app_state = init_test(cx);
+        let workspace =
+            open_local_project(path!("/handoff"), smoke_test_project(), &app_state, cx).await;
+
+        let window = cx.update(|cx| cx.windows()[0].downcast::<MultiWorkspace>().unwrap());
+        cx.dispatch_action(*window, zed_actions::OpenDevContainer);
+        deliver_next_frame(cx);
+
+        assert_eq!(
+            workspace.update(cx, |workspace, cx| workspace
+                .active_modal::<crate::remote_servers::RemoteServerProjects>(cx)
+                .map(|modal| modal.read(cx).dev_container_progress())),
+            Some(Some("creating".to_string())),
+            "the handoff is only interesting while the container is being created"
+        );
+
+        // The modal handoff `open_remote_project` performs, run at each side of
+        // the transition out of creation.
+        let attempt_handoff = |cx: &mut TestAppContext| {
+            window
+                .update(cx, |multi_workspace, window, cx| {
+                    let workspace = multi_workspace.workspace().clone();
+                    workspace.update(cx, |workspace, cx| {
+                        workspace.hide_modal(window, cx);
+                        workspace.toggle_modal(window, cx, |window, cx| {
+                            crate::RemoteConnectionModal::new(
+                                &RemoteConnectionOptions::Docker(DockerConnectionOptions::default()),
+                                Vec::new(),
+                                window,
+                                cx,
+                            )
+                        });
+                        workspace
+                            .active_modal::<crate::RemoteConnectionModal>(cx)
+                            .is_some()
+                    })
+                })
+                .unwrap()
+        };
+
+        assert!(
+            !attempt_handoff(cx),
+            "while the container is still being created the modal must hold the layer, \
+             or this test is not exercising the transition the defect turns on"
+        );
+
+        workspace.update(cx, |workspace, cx| {
+            workspace
+                .active_modal::<crate::remote_servers::RemoteServerProjects>(cx)
+                .expect("the Dev Container modal is showing")
+                .update(cx, |modal, _cx| modal.dev_container_creation_finished());
+        });
+
+        assert!(
+            attempt_handoff(cx),
+            "once the container is created the connection modal must be able to replace the \
+             Dev Container modal; without it the connection is abandoned with no window, no \
+             error, and nothing in the log"
+        );
+    }
+
     /// "Don't Show Again" is recorded against the project, and the state check
     /// has to honor it just as the change trigger did.
     #[gpui::test]

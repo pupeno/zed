@@ -4405,9 +4405,10 @@ async fn test_git_blame_is_forwarded(cx_a: &mut TestAppContext, cx_b: &mut TestA
         .fs()
         .with_git_state(Path::new(path!("/my-repo/.git")), true, |state| {
             state.refs.insert("HEAD".into(), revision.to_string());
-            state
-                .head_contents
-                .insert(repo_path("file.txt"), content_at_revision.to_string());
+            state.head_contents.insert(
+                repo_path("file.txt"),
+                content_at_revision.as_bytes().to_vec(),
+            );
             state
                 .blames_at_revision
                 .insert((repo_path("file.txt"), revision), blame_at_revision.clone());
@@ -6447,5 +6448,6 @@ fn blame_entry(sha: &str, range: Range<u32>) -> git::blame::BlameEntry {
         summary: None,
         previous: None,
         filename: String::new(),
+        boundary: false,
     }
 }

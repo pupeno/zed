@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt::Display,
-    path::{Path, PathBuf},
     sync::Arc,
 };
 
@@ -9,7 +8,10 @@ use futures::TryFutureExt;
 use gpui::{AsyncWindowContext, Entity};
 use project::Worktree;
 use serde::Deserialize;
-use settings::{DevContainerConnection, infer_json_indent_size, replace_value_in_json_text};
+use settings::{
+    DevContainerConnection, DevContainerProjectHost, DevContainerProjectPathStyle,
+    infer_json_indent_size, replace_value_in_json_text,
+};
 use util::rel_path::RelPath;
 use walkdir::WalkDir;
 use workspace::Workspace;
@@ -21,6 +23,7 @@ use crate::{
     devcontainer_manifest::{read_devcontainer_configuration, spawn_dev_container},
     devcontainer_templates_repository, get_latest_oci_manifest, get_oci_token, ghcr_registry,
     oci::download_oci_tarball,
+    project_host::{HostCommand, ProjectHostCapability},
 };
 
 /// Represents a discovered devcontainer configuration
@@ -28,24 +31,46 @@ use crate::{
 pub struct DevContainerConfig {
     /// Display name for the configuration (subfolder name or "default")
     pub name: String,
-    /// Relative path to the devcontainer.json file from the project root
-    pub config_path: PathBuf,
+    /// Path to the devcontainer.json file, relative to the project root on the
+    /// project host. A [`RelPath`] rather than a [`PathBuf`] because the path
+    /// belongs to the project host: the desktop only carries it from the
+    /// worktree that discovered it to the host root it is resolved against, and
+    /// must not read its separators with its own rules on the way.
+    pub config_path: Arc<RelPath>,
 }
 
 impl DevContainerConfig {
+    /// The path a Dev Container configuration lives at when none was chosen.
+    pub fn default_config_path() -> Arc<RelPath> {
+        RelPath::from_unix_str(".devcontainer/devcontainer.json")
+            .expect("valid path")
+            .into_arc()
+    }
+
     pub fn default_config() -> Self {
         Self {
             name: "default".to_string(),
-            config_path: PathBuf::from(".devcontainer/devcontainer.json"),
+            config_path: Self::default_config_path(),
         }
     }
 
     pub fn root_config() -> Self {
         Self {
             name: "root".to_string(),
-            config_path: PathBuf::from(".devcontainer.json"),
+            config_path: RelPath::from_unix_str(".devcontainer.json")
+                .expect("valid path")
+                .into_arc(),
         }
     }
+}
+
+pub fn is_supported_dev_container_source_connection(
+    connection: &remote::RemoteConnectionOptions,
+) -> bool {
+    matches!(
+        connection,
+        remote::RemoteConnectionOptions::Ssh(_) | remote::RemoteConnectionOptions::Wsl(_)
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,7 +199,7 @@ pub fn find_devcontainer_configs(workspace: &Workspace, cx: &gpui::App) -> Vec<D
 pub fn find_configs_in_snapshot(snapshot: &Snapshot) -> Vec<DevContainerConfig> {
     let mut configs = Vec::new();
 
-    let devcontainer_dir_path = RelPath::from_unix_str(".devcontainer").expect("valid path");
+    let devcontainer_dir_path = paths::local_dev_container_folder_path();
 
     if let Some(devcontainer_entry) = snapshot.entry_for_path(devcontainer_dir_path) {
         if devcontainer_entry.is_dir() {
@@ -209,7 +234,7 @@ pub fn find_configs_in_snapshot(snapshot: &Snapshot) -> Vec<DevContainerConfig> 
                             );
                             configs.push(DevContainerConfig {
                                 name: subfolder_name,
-                                config_path: PathBuf::from(&config_json_path),
+                                config_path: rel_config_path.into_arc(),
                             });
                         } else {
                             log::debug!(
@@ -257,20 +282,34 @@ pub async fn start_dev_container_with_config(
     config: Option<DevContainerConfig>,
     environment: HashMap<String, String>,
 ) -> Result<(DevContainerConnection, String), DevContainerError> {
-    check_for_docker(context.use_podman).await?;
+    check_for_docker(&*context.host(), context.use_podman).await?;
 
     let Some(actual_config) = config.clone() else {
         return Err(DevContainerError::NotInValidProject);
     };
+    let project_host = context
+        .project_host
+        .remote_connection_options()
+        .and_then(|connection| match connection {
+            remote::RemoteConnectionOptions::Ssh(options) => Some(DevContainerProjectHost::Ssh {
+                host: options.host.to_string(),
+                username: options.username,
+                port: options.port,
+            }),
+            remote::RemoteConnectionOptions::Wsl(options) => Some(DevContainerProjectHost::Wsl {
+                distro_name: options.distro_name,
+                user: options.user,
+            }),
+            _ => None,
+        });
+    let project_root = project_host
+        .as_ref()
+        .map(|_| context.project_host.project_root().clone());
+    let devcontainer_config = project_root
+        .as_ref()
+        .map(|project_root| project_root.join(actual_config.config_path.as_unix_str()));
 
-    match spawn_dev_container(
-        &context,
-        environment.clone(),
-        actual_config.clone(),
-        context.project_directory.clone().as_ref(),
-    )
-    .await
-    {
+    match spawn_dev_container(&context, environment.clone(), actual_config.clone()).await {
         Ok(DevContainerUp {
             container_id,
             remote_workspace_folder,
@@ -294,6 +333,15 @@ pub async fn start_dev_container_with_config(
                 remote_user,
                 extension_ids,
                 remote_env: remote_env.into_iter().collect(),
+                project_host,
+                project_path_style: context.project_host.remote_connection_options().map(|_| {
+                    match context.project_host.path_style() {
+                        util::paths::PathStyle::Unix => DevContainerProjectPathStyle::Unix,
+                        util::paths::PathStyle::Windows => DevContainerProjectPathStyle::Windows,
+                    }
+                }),
+                project_root: project_root.map(|path| path.as_str().to_string()),
+                devcontainer_config: devcontainer_config.map(|path| path.as_str().to_string()),
             };
 
             Ok((connection, remote_workspace_folder))
@@ -306,18 +354,22 @@ pub async fn start_dev_container_with_config(
     }
 }
 
-async fn check_for_docker(use_podman: bool) -> Result<(), DevContainerError> {
-    let mut command = if use_podman {
-        util::command::new_command("podman")
-    } else {
-        util::command::new_command("docker")
-    };
+async fn check_for_docker(
+    host: &dyn ProjectHostCapability,
+    use_podman: bool,
+) -> Result<(), DevContainerError> {
+    let mut command = HostCommand::new(if use_podman { "podman" } else { "docker" });
     command.arg("--version");
 
-    match command.output().await {
-        Ok(_) => Ok(()),
+    match host.run(&command).await {
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            log::error!("Unable to find docker on the project host: {stderr}");
+            Err(DevContainerError::DockerNotAvailable)
+        }
         Err(e) => {
-            log::error!("Unable to find docker in $PATH: {:?}", e);
+            log::error!("Unable to find docker on the project host: {:?}", e);
             Err(DevContainerError::DockerNotAvailable)
         }
     }
@@ -363,6 +415,12 @@ pub(crate) async fn apply_devcontainer_template(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
+    // Desktop-local: the template tarball is fetched over HTTP by the desktop and
+    // unpacked with the desktop's filesystem and directory walker, so the project
+    // host never sees this directory. The extracted files reach the project host
+    // only through `worktree.create_entry` below, which writes wherever the
+    // project lives. Nothing here is a project-host path, so the host temporary
+    // root would be the wrong place for it.
     let extract_dir = std::env::temp_dir()
         .join(&template.id)
         .join(format!("extracted-{timestamp}"));
@@ -477,30 +535,144 @@ fn expand_template_options(content: String, template_options: &HashMap<String, S
 }
 
 fn get_backup_project_name(remote_workspace_folder: &str, container_id: &str) -> String {
-    Path::new(remote_workspace_folder)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .map(|string| string.to_string())
+    // The workspace folder is a path inside the container, so its only separator
+    // is `/`. Splitting it with the desktop's rules would additionally break a
+    // Windows desktop on a backslash, which is an ordinary character in a
+    // container path.
+    unix_base_name(remote_workspace_folder)
+        .map(|name| name.to_string())
         .unwrap_or_else(|| container_id.to_string())
+}
+
+/// The last component of a `/`-separated path inside a container.
+pub(crate) fn unix_base_name(path: &str) -> Option<&str> {
+    let name = path
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or_default();
+    (!name.is_empty()).then_some(name)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::rc::Rc;
 
-    use crate::devcontainer_api::{DevContainerConfig, find_configs_in_snapshot};
+    use crate::{
+        devcontainer_api::{
+            DevContainerConfig, DevContainerError, check_for_docker, find_configs_in_snapshot,
+            is_supported_dev_container_source_connection,
+        },
+        project_host::{ProjectHostCapability, test_support::RecordingProjectHost},
+    };
     use fs::FakeFs;
     use gpui::TestAppContext;
     use project::Project;
+    use remote::{
+        DockerConnectionOptions, HostDockerConnectionOptions, HostPathBuf,
+        ProjectHostConnectionOptions, RemoteConnectionOptions, SshConnectionOptions,
+        WslConnectionOptions,
+    };
     use serde_json::json;
     use settings::SettingsStore;
-    use util::path;
+    use util::{path, rel_path::RelPath};
+
+    const TEST_SOURCE_ROOT: &str = "/path/to/source/project";
 
     fn init_test(cx: &mut TestAppContext) {
         cx.update(|cx| {
             let settings_store = SettingsStore::test(cx);
             cx.set_global(settings_store);
         });
+    }
+
+    fn recording_host(cx: &mut TestAppContext) -> Rc<RecordingProjectHost> {
+        Rc::new(RecordingProjectHost::new(
+            TEST_SOURCE_ROOT,
+            "/host/tmp",
+            FakeFs::new(cx.executor()),
+        ))
+    }
+
+    #[test]
+    fn ssh_and_wsl_are_supported_dev_container_source_connections() {
+        assert!(is_supported_dev_container_source_connection(
+            &RemoteConnectionOptions::Ssh(SshConnectionOptions::default())
+        ));
+        assert!(is_supported_dev_container_source_connection(
+            &RemoteConnectionOptions::Wsl(WslConnectionOptions {
+                distro_name: "Ubuntu".to_string(),
+                user: None,
+            })
+        ));
+        assert!(!is_supported_dev_container_source_connection(
+            &RemoteConnectionOptions::Docker(DockerConnectionOptions::default())
+        ));
+        assert!(!is_supported_dev_container_source_connection(
+            &RemoteConnectionOptions::Docker(DockerConnectionOptions {
+                use_podman: true,
+                ..Default::default()
+            })
+        ));
+        assert!(!is_supported_dev_container_source_connection(
+            &RemoteConnectionOptions::HostDocker(HostDockerConnectionOptions {
+                project_host: ProjectHostConnectionOptions::Ssh(SshConnectionOptions::default()),
+                project_root: HostPathBuf::from_path("/project", util::paths::PathStyle::Unix),
+                devcontainer_config: HostPathBuf::from_path(
+                    "/project/.devcontainer/devcontainer.json",
+                    util::paths::PathStyle::Unix,
+                ),
+                container: DockerConnectionOptions::default(),
+            })
+        ));
+    }
+
+    #[gpui::test]
+    async fn docker_is_probed_on_the_project_host(cx: &mut TestAppContext) {
+        let host = recording_host(cx);
+
+        check_for_docker(&*host, false).await.unwrap();
+
+        let probes = host.commands_by_program("docker");
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].arguments(), vec!["--version"]);
+        assert_eq!(
+            probes[0].working_directory,
+            host.source_root().clone(),
+            "the engine that builds the container is the project host's, so probe it there"
+        );
+    }
+
+    #[gpui::test]
+    async fn podman_is_probed_on_the_project_host(cx: &mut TestAppContext) {
+        let host = recording_host(cx);
+
+        check_for_docker(&*host, true).await.unwrap();
+
+        assert_eq!(host.commands_by_program("podman").len(), 1);
+        assert!(host.commands_by_program("docker").is_empty());
+    }
+
+    #[gpui::test]
+    async fn a_project_host_without_docker_reports_it_as_unavailable(cx: &mut TestAppContext) {
+        let host = recording_host(cx);
+        host.fail_program("docker");
+
+        let result = check_for_docker(&*host, false).await;
+
+        assert!(matches!(result, Err(DevContainerError::DockerNotAvailable)));
+    }
+
+    #[gpui::test]
+    async fn a_project_host_that_cannot_be_reached_reports_docker_as_unavailable(
+        cx: &mut TestAppContext,
+    ) {
+        let host = recording_host(cx);
+        host.fail_to_start("docker");
+
+        let result = check_for_docker(&*host, false).await;
+
+        assert!(matches!(result, Err(DevContainerError::DockerNotAvailable)));
     }
 
     #[gpui::test]
@@ -528,7 +700,7 @@ mod tests {
 
         assert_eq!(configs.len(), 1);
         assert_eq!(configs[0].name, "root");
-        assert_eq!(configs[0].config_path, PathBuf::from(".devcontainer.json"));
+        assert_eq!(configs[0].config_path.as_unix_str(), ".devcontainer.json");
     }
 
     #[gpui::test]
@@ -718,12 +890,197 @@ mod tests {
 
         assert_eq!(configs.len(), 2);
         assert_eq!(configs[0].name, "root");
-        assert_eq!(configs[0].config_path, PathBuf::from(".devcontainer.json"));
+        assert_eq!(configs[0].config_path.as_unix_str(), ".devcontainer.json");
         assert_eq!(configs[1].name, "rust");
         assert_eq!(
-            configs[1].config_path,
-            PathBuf::from(".devcontainer/rust/devcontainer.json")
+            configs[1].config_path.as_unix_str(),
+            ".devcontainer/rust/devcontainer.json"
         );
+    }
+
+    /// The reported case: a project deliberately parked inside a directory an
+    /// enclosing repository ignores. Every entry under the worktree root is
+    /// then marked ignored, and ignored directories are not loaded, so
+    /// `.devcontainer` used to stay an unloaded directory with no children and
+    /// the project was silently treated as having no configuration.
+    #[gpui::test]
+    async fn test_find_configs_when_an_enclosing_repository_ignores_the_project(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/enclosing"),
+            json!({
+                ".git": {},
+                ".gitignore": "ignored-tree\n",
+                "ignored-tree": {
+                    "project": {
+                        ".devcontainer": {
+                            "devcontainer.json": "{}"
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let project =
+            Project::test(fs, [path!("/enclosing/ignored-tree/project").as_ref()], cx).await;
+        cx.run_until_parked();
+
+        let configs = project.read_with(cx, |project, cx| {
+            let worktree = project
+                .visible_worktrees(cx)
+                .next()
+                .expect("should have a worktree");
+            find_configs_in_snapshot(worktree.read(cx))
+        });
+
+        assert_eq!(configs, vec![DevContainerConfig::default_config()]);
+    }
+
+    /// Named configurations live one level below `.devcontainer`, so reaching
+    /// them under an ignoring parent means loading that subdirectory too.
+    #[gpui::test]
+    async fn test_find_configs_subfolder_when_an_enclosing_repository_ignores_the_project(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/enclosing"),
+            json!({
+                ".git": {},
+                ".gitignore": "ignored-tree\n",
+                "ignored-tree": {
+                    "project": {
+                        ".devcontainer": {
+                            "devcontainer.json": "{}",
+                            "gpu": {
+                                "devcontainer.json": "{}"
+                            }
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let project =
+            Project::test(fs, [path!("/enclosing/ignored-tree/project").as_ref()], cx).await;
+        cx.run_until_parked();
+
+        let configs = project.read_with(cx, |project, cx| {
+            let worktree = project
+                .visible_worktrees(cx)
+                .next()
+                .expect("should have a worktree");
+            find_configs_in_snapshot(worktree.read(cx))
+        });
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].name, "default");
+        assert_eq!(configs[1].name, "gpu");
+        assert_eq!(
+            configs[1].config_path.as_unix_str(),
+            ".devcontainer/gpu/devcontainer.json"
+        );
+    }
+
+    /// Reaching into `.devcontainer` must not turn into reaching into the whole
+    /// ignored tree: the cost of finding a configuration stays proportional to
+    /// the configuration, not to the project.
+    #[gpui::test]
+    async fn test_find_configs_under_an_ignoring_repository_does_not_scan_the_rest(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/enclosing"),
+            json!({
+                ".git": {},
+                ".gitignore": "ignored-tree\n",
+                "ignored-tree": {
+                    "project": {
+                        ".devcontainer": {
+                            "devcontainer.json": "{}"
+                        },
+                        "node_modules": {
+                            "some-package": {
+                                "index.js": "module.exports = {};"
+                            }
+                        }
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let project =
+            Project::test(fs, [path!("/enclosing/ignored-tree/project").as_ref()], cx).await;
+        cx.run_until_parked();
+
+        project.read_with(cx, |project, cx| {
+            let worktree = project
+                .visible_worktrees(cx)
+                .next()
+                .expect("should have a worktree");
+            let snapshot = worktree.read(cx);
+
+            assert_eq!(
+                find_configs_in_snapshot(snapshot),
+                vec![DevContainerConfig::default_config()]
+            );
+
+            let deep_path =
+                RelPath::from_unix_str("node_modules/some-package/index.js").expect("valid path");
+            assert!(
+                snapshot.entry_for_path(deep_path).is_none(),
+                "the rest of the ignored tree should still be deferred"
+            );
+        });
+    }
+
+    /// The project's own `.gitignore` excluding `.devcontainer` reaches the same
+    /// scan-deferral gate as an enclosing repository ignoring the whole project,
+    /// so it must not hide the configuration either.
+    #[gpui::test]
+    async fn test_find_configs_when_the_project_ignores_its_own_devcontainer_dir(
+        cx: &mut TestAppContext,
+    ) {
+        init_test(cx);
+        let fs = FakeFs::new(cx.executor());
+        fs.insert_tree(
+            path!("/project"),
+            json!({
+                ".git": {},
+                ".gitignore": ".devcontainer\n",
+                ".devcontainer": {
+                    "devcontainer.json": "{}",
+                    "gpu": {
+                        "devcontainer.json": "{}"
+                    }
+                }
+            }),
+        )
+        .await;
+
+        let project = Project::test(fs, [path!("/project").as_ref()], cx).await;
+        cx.run_until_parked();
+
+        let configs = project.read_with(cx, |project, cx| {
+            let worktree = project
+                .visible_worktrees(cx)
+                .next()
+                .expect("should have a worktree");
+            find_configs_in_snapshot(worktree.read(cx))
+        });
+
+        assert_eq!(configs.len(), 2);
+        assert_eq!(configs[0].name, "default");
+        assert_eq!(configs[1].name, "gpu");
     }
 
     #[gpui::test]

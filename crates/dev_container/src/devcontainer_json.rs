@@ -1,9 +1,13 @@
-use std::{collections::HashMap, fmt::Display, path::Path, sync::Arc};
+use std::{collections::HashMap, fmt::Display};
 
-use crate::{command_json::CommandRunner, devcontainer_api::DevContainerError};
+use remote::HostPathBuf;
+
+use crate::{
+    devcontainer_api::DevContainerError,
+    project_host::{HostCommand, ProjectHostCapability},
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json_lenient::Value;
-use util::command::Command;
 
 #[derive(Debug, Deserialize, Serialize, Eq, PartialEq, Clone)]
 #[serde(untagged)]
@@ -350,13 +354,13 @@ impl LifecycleScript {
     fn from_args(args: Vec<String>) -> Self {
         Self::from_map(HashMap::from([("default".to_string(), args)]))
     }
-    pub fn script_commands(&self) -> HashMap<String, Command> {
+    pub fn script_commands(&self) -> HashMap<String, HostCommand> {
         self.scripts
             .iter()
             .filter_map(|(k, v)| {
                 if let Some(inner_command) = &v.command {
-                    let mut command = Command::new(inner_command);
-                    command.args(&v.args);
+                    let mut command = HostCommand::new(inner_command);
+                    command.args(v.args.clone());
                     Some((k.clone(), command))
                 } else {
                     log::warn!(
@@ -369,23 +373,22 @@ impl LifecycleScript {
             .collect()
     }
 
+    /// Runs the script on the project host. Only `initializeCommand` takes this
+    /// path; every other lifecycle hook runs inside the created container.
     pub async fn run(
         &self,
-        command_runnder: &Arc<dyn CommandRunner>,
-        working_directory: &Path,
+        host: &dyn ProjectHostCapability,
+        working_directory: &HostPathBuf,
     ) -> Result<(), DevContainerError> {
         for (command_name, mut command) in self.script_commands() {
             log::debug!("Running script {command_name}");
 
-            command.current_dir(working_directory);
+            command.current_dir(working_directory.clone());
 
-            let output = command_runnder
-                .run_command(&mut command)
-                .await
-                .map_err(|e| {
-                    log::error!("Error running command {command_name}: {e}");
-                    DevContainerError::CommandFailed(command_name.clone())
-                })?;
+            let output = host.run(&command).await.map_err(|e| {
+                log::error!("Error running command {command_name}: {e}");
+                DevContainerError::CommandFailed(command_name.clone())
+            })?;
             if !output.status.success() {
                 let std_err = String::from_utf8_lossy(&output.stderr);
                 log::error!(
@@ -1775,18 +1778,14 @@ mod test {
             let cmd = cmds
                 .get("default")
                 .expect("String command should have a 'default' key");
-            let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_os_string()).collect();
             assert_eq!(
-                cmd.get_program(),
-                std::ffi::OsStr::new("/bin/sh"),
+                cmd.program(),
+                "/bin/sh",
                 "String-form lifecycle command program must be /bin/sh"
             );
             assert_eq!(
-                args,
-                vec![
-                    std::ffi::OsString::from("-c"),
-                    std::ffi::OsString::from("echo $HOME"),
-                ],
+                cmd.get_args(),
+                ["-c", "echo $HOME"],
                 "String-form lifecycle command args must be -c <script> so the shell expands $HOME"
             );
         } else {
@@ -1818,18 +1817,14 @@ mod test {
             let cmd = cmds
                 .get("default")
                 .expect("Array command should have a 'default' key");
-            let args: Vec<std::ffi::OsString> = cmd.get_args().map(|a| a.to_os_string()).collect();
             assert_eq!(
-                cmd.get_program(),
-                std::ffi::OsStr::new("/usr/bin/env"),
+                cmd.program(),
+                "/usr/bin/env",
                 "Array-form lifecycle command must exec the first element directly"
             );
             assert_eq!(
-                args,
-                vec![
-                    std::ffi::OsString::from("echo"),
-                    std::ffi::OsString::from("hello"),
-                ],
+                cmd.get_args(),
+                ["echo", "hello"],
                 "Array-form lifecycle command must pass remaining elements as args without a shell wrapper"
             );
         } else {

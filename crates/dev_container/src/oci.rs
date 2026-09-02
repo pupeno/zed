@@ -89,12 +89,19 @@ where
     get_deserialized_response(token, &url, client).await
 }
 
+/// Downloads and unpacks an OCI blob.
+///
+/// Desktop-local throughout: the desktop holds the registry credentials and the
+/// HTTP client, so `dest_dir` is a desktop path unpacked with the desktop `fs`.
+/// Callers that need the result on the project host stage it there afterwards;
+/// nothing here may be handed a project-host path.
 pub(crate) async fn download_oci_tarball(
     token: &str,
     registry: &str,
     repository_path: &str,
     blob_digest: &str,
     accept_header: &str,
+    // Desktop-local: see the note above.
     dest_dir: &PathBuf,
     client: &Arc<dyn HttpClient>,
     fs: &Arc<dyn Fs>,

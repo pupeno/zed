@@ -25,24 +25,14 @@ use gpui::{App, AppContext, AsyncApp, Task};
 use rpc::proto::Envelope;
 
 use crate::{
-    RemoteArch, RemoteClientDelegate, RemoteConnection, RemoteConnectionOptions, RemoteOs,
-    RemotePlatform,
+    HostPathBuf, HostProcessRequest, ProjectHost, RemoteArch, RemoteClientDelegate,
+    RemoteConnection, RemoteConnectionOptions, RemoteOs, RemotePlatform, SshConnectionOptions,
+    WslConnectionOptions,
     remote_client::{CommandTemplate, Interactive},
     transport::parse_platform,
 };
 
-#[derive(
-    Debug,
-    Default,
-    Clone,
-    PartialEq,
-    Eq,
-    Hash,
-    PartialOrd,
-    Ord,
-    serde::Serialize,
-    serde::Deserialize,
-)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub struct DockerConnectionOptions {
     pub name: String,
     pub container_id: String,
@@ -50,6 +40,32 @@ pub struct DockerConnectionOptions {
     pub upload_binary_over_docker_exec: bool,
     pub use_podman: bool,
     pub remote_env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum ProjectHostConnectionOptions {
+    Ssh(SshConnectionOptions),
+    Wsl(WslConnectionOptions),
+}
+
+impl ProjectHostConnectionOptions {
+    pub fn remote_connection_options(&self) -> RemoteConnectionOptions {
+        match self {
+            Self::Ssh(options) => RemoteConnectionOptions::Ssh(options.clone()),
+            Self::Wsl(options) => RemoteConnectionOptions::Wsl(options.clone()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct HostDockerConnectionOptions {
+    pub project_host: ProjectHostConnectionOptions,
+    /// Where the source project lives on the project host, in that host's path
+    /// rules. Recorded as provenance so the container can be traced back to the
+    /// checkout it was built from, whatever desktop reopens it.
+    pub project_root: HostPathBuf,
+    pub devcontainer_config: HostPathBuf,
+    pub container: DockerConnectionOptions,
 }
 
 pub(crate) struct DockerExecConnection {
@@ -61,11 +77,46 @@ pub(crate) struct DockerExecConnection {
     os_version: Option<String>,
     path_style: Option<PathStyle>,
     shell: String,
+    project_host: Option<Arc<ProjectHost>>,
+    host_backed_options: Option<HostDockerConnectionOptions>,
 }
 
 impl DockerExecConnection {
     pub async fn new(
         connection_options: DockerConnectionOptions,
+        delegate: Arc<dyn RemoteClientDelegate>,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
+        Self::new_with_project_host(connection_options, None, None, delegate, cx).await
+    }
+
+    pub async fn new_host_backed(
+        connection_options: HostDockerConnectionOptions,
+        delegate: Arc<dyn RemoteClientDelegate>,
+        cx: &mut AsyncApp,
+    ) -> Result<Self> {
+        let project_host_options = connection_options.project_host.remote_connection_options();
+        let project_host_connection =
+            crate::connect(project_host_options, delegate.clone(), cx).await?;
+        let project_host = Arc::new(ProjectHost::from_remote_connection(
+            connection_options.project_root.clone(),
+            project_host_connection,
+        )?);
+        let container = connection_options.container.clone();
+        Self::new_with_project_host(
+            container,
+            Some(project_host),
+            Some(connection_options),
+            delegate,
+            cx,
+        )
+        .await
+    }
+
+    async fn new_with_project_host(
+        connection_options: DockerConnectionOptions,
+        project_host: Option<Arc<ProjectHost>>,
+        host_backed_options: Option<HostDockerConnectionOptions>,
         delegate: Arc<dyn RemoteClientDelegate>,
         cx: &mut AsyncApp,
     ) -> Result<Self> {
@@ -78,6 +129,8 @@ impl DockerExecConnection {
             os_version: None,
             path_style: None,
             shell: "sh".to_owned(),
+            project_host,
+            host_backed_options,
         };
         let (release_channel, version, commit) = cx.update(|cx| {
             (
@@ -492,6 +545,45 @@ impl DockerExecConnection {
         let dest_path_str = dest_path.display(self.path_style());
         let full_server_path = format!("{}/{}", remote_dir_for_server, dest_path_str);
 
+        if let Some(project_host) = &self.project_host {
+            let file_name = src_path
+                .file_name()
+                .map(|file_name| file_name.to_string_lossy())
+                .unwrap_or_else(|| "zed-remote-server".into());
+            let staged_path = project_host.temporary_root().await?.join(format!(
+                "zed-{}-{}",
+                std::process::id(),
+                file_name
+            ));
+            let contents = smol::fs::read(src_path).await?;
+            project_host.write_file(&staged_path, &contents).await?;
+            self.run_docker_command(
+                "cp",
+                &[
+                    staged_path.as_str().to_string(),
+                    format!(
+                        "{}:{full_server_path}",
+                        self.connection_options.container_id
+                    ),
+                ],
+            )
+            .await?;
+            self.run_docker_command(
+                "exec",
+                &[
+                    self.connection_options.container_id.clone(),
+                    "chown".to_string(),
+                    format!(
+                        "{}:{}",
+                        self.connection_options.remote_user, self.connection_options.remote_user
+                    ),
+                    full_server_path,
+                ],
+            )
+            .await?;
+            return Ok(());
+        }
+
         Self::upload_and_chown(
             self.docker_cli().to_string(),
             self.connection_options.clone(),
@@ -506,6 +598,24 @@ impl DockerExecConnection {
         subcommand: &str,
         args: &[impl AsRef<str>],
     ) -> Result<String> {
+        if let Some(project_host) = &self.project_host {
+            let outcome = project_host
+                .start_process(
+                    HostProcessRequest::new(self.docker_cli(), project_host.project_root().clone())
+                        .arguments(
+                            std::iter::once(subcommand).chain(args.iter().map(|arg| arg.as_ref())),
+                        ),
+                )?
+                .collect_output()
+                .await?;
+            anyhow::ensure!(
+                outcome.status.success(),
+                "failed to run {} on project host: {}",
+                self.docker_cli(),
+                String::from_utf8_lossy(&outcome.stderr)
+            );
+            return Ok(String::from_utf8_lossy(&outcome.stdout).to_string());
+        }
         let mut command = util::command::new_command(self.docker_cli());
         command.arg(subcommand);
         for arg in args {
@@ -704,18 +814,29 @@ impl RemoteConnection for DockerExecConnection {
         if reconnect {
             docker_args.push("--reconnect".to_string());
         }
-        let mut command = util::command::new_command(self.docker_cli());
-        command
-            .kill_on_drop(true)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .args(docker_args);
+        let child = if let Some(project_host) = &self.project_host {
+            project_host
+                .start_process(
+                    HostProcessRequest::new(self.docker_cli(), project_host.project_root().clone())
+                        .arguments(docker_args),
+                )
+                .map(|process| process.into_child())
+        } else {
+            let mut command = util::command::new_command(self.docker_cli());
+            command
+                .kill_on_drop(true)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .args(docker_args);
+            command.spawn().map_err(Into::into)
+        };
 
-        let Ok(child) = command.spawn() else {
-            return Task::ready(Err(anyhow::anyhow!(
-                "Failed to start remote server process"
-            )));
+        let child = match child {
+            Ok(child) => child,
+            Err(error) => {
+                return Task::ready(Err(error.context("starting remote server process")));
+            }
         };
 
         let mut proxy_process = self.proxy_process.lock();
@@ -745,6 +866,57 @@ impl RemoteConnection for DockerExecConnection {
         dest_path: RemotePathBuf,
         cx: &App,
     ) -> Task<Result<()>> {
+        if let Some(project_host) = &self.project_host {
+            let project_host = project_host.clone();
+            let docker_cli = self.docker_cli().to_string();
+            let container_id = self.connection_options.container_id.clone();
+            let remote_user = self.connection_options.remote_user.clone();
+            let dest_path = dest_path.to_string();
+            return cx.spawn(async move |cx| {
+                let staged_path = project_host
+                    .temporary_root()
+                    .await?
+                    .join(format!("zed-{}-directory-upload", std::process::id()));
+                let staging_task =
+                    cx.update(|cx| project_host.stage_assets(src_path, staged_path.clone(), cx));
+                staging_task.await?;
+                let output = project_host
+                    .start_process(
+                        HostProcessRequest::new(&docker_cli, project_host.project_root().clone())
+                            .arguments([
+                                "cp".to_string(),
+                                staged_path.as_str().to_string(),
+                                format!("{container_id}:{dest_path}"),
+                            ]),
+                    )?
+                    .collect_output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "failed to upload directory through project host: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let output = project_host
+                    .start_process(
+                        HostProcessRequest::new(&docker_cli, project_host.project_root().clone())
+                            .arguments([
+                                "exec".to_string(),
+                                container_id,
+                                "chown".to_string(),
+                                format!("{remote_user}:{remote_user}"),
+                                dest_path,
+                            ]),
+                    )?
+                    .collect_output()
+                    .await?;
+                anyhow::ensure!(
+                    output.status.success(),
+                    "failed to change ownership through project host: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                Ok(())
+            });
+        }
         let dest_path_str = dest_path.to_string();
         let src_path_display = src_path.display().to_string();
 
@@ -833,6 +1005,14 @@ impl RemoteConnection for DockerExecConnection {
 
         docker_args.append(&mut inner_program);
 
+        if let Some(project_host) = &self.project_host {
+            return project_host.build_command(
+                HostProcessRequest::new(self.docker_cli(), project_host.project_root().clone())
+                    .arguments(docker_args),
+                interactive,
+            );
+        }
+
         Ok(CommandTemplate {
             program: self.docker_cli().to_string(),
             args: docker_args,
@@ -849,7 +1029,10 @@ impl RemoteConnection for DockerExecConnection {
     }
 
     fn connection_options(&self) -> RemoteConnectionOptions {
-        RemoteConnectionOptions::Docker(self.connection_options.clone())
+        self.host_backed_options
+            .clone()
+            .map(RemoteConnectionOptions::HostDocker)
+            .unwrap_or_else(|| RemoteConnectionOptions::Docker(self.connection_options.clone()))
     }
 
     fn path_style(&self) -> PathStyle {

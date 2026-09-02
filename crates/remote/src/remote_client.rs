@@ -1284,6 +1284,11 @@ impl ConnectionPool {
                                 .await
                                 .map(|connection| Arc::new(connection) as Arc<dyn RemoteConnection>)
                         }
+                        RemoteConnectionOptions::HostDocker(opts) => {
+                            DockerExecConnection::new_host_backed(opts, delegate, cx)
+                                .await
+                                .map(|connection| Arc::new(connection) as Arc<dyn RemoteConnection>)
+                        }
                         #[cfg(any(test, feature = "test-support"))]
                         RemoteConnectionOptions::Mock(opts) => match cx.update(|cx| {
                             cx.default_global::<crate::transport::mock::MockConnectionRegistry>()
@@ -1331,6 +1336,7 @@ pub enum RemoteConnectionOptions {
     Ssh(SshConnectionOptions),
     Wsl(WslConnectionOptions),
     Docker(DockerConnectionOptions),
+    HostDocker(crate::HostDockerConnectionOptions),
     #[cfg(any(test, feature = "test-support"))]
     Mock(crate::transport::mock::MockConnectionOptions),
 }
@@ -1350,6 +1356,17 @@ impl RemoteConnectionOptions {
                     opts.name.clone()
                 }
             }
+            RemoteConnectionOptions::HostDocker(opts) => {
+                let name = if opts.container.use_podman {
+                    format!("[podman] {}", opts.container.name)
+                } else {
+                    opts.container.name.clone()
+                };
+                format!(
+                    "{name} via {}",
+                    opts.project_host.remote_connection_options().display_name()
+                )
+            }
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(opts) => format!("mock-{}", opts.id),
         }
@@ -1363,6 +1380,13 @@ impl RemoteConnectionOptions {
             RemoteConnectionOptions::Wsl(_) => "wsl",
             RemoteConnectionOptions::Docker(opts) => {
                 if opts.use_podman {
+                    "podman"
+                } else {
+                    "docker"
+                }
+            }
+            RemoteConnectionOptions::HostDocker(opts) => {
+                if opts.container.use_podman {
                     "podman"
                 } else {
                     "docker"

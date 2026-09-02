@@ -1,13 +1,14 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{collections::HashMap, rc::Rc};
 
 use async_trait::async_trait;
+use remote::HostPathBuf;
 use serde::{Deserialize, Deserializer, Serialize, de};
-use util::command::Command;
 
 use crate::{
     command_json::{evaluate_json_command, evaluate_yaml_command},
     devcontainer_api::DevContainerError,
     devcontainer_json::MountDefinition,
+    project_host::{HostCommand, ProjectHostCapability},
 };
 
 #[derive(Debug, Deserialize, Serialize, Eq, PartialEq)]
@@ -191,6 +192,7 @@ pub(crate) struct DockerComposeConfig {
 }
 
 pub(crate) struct Docker {
+    host: Rc<dyn ProjectHostCapability>,
     docker_cli: String,
     has_buildx: bool,
 }
@@ -202,7 +204,11 @@ impl DockerInspect {
 }
 
 impl Docker {
-    pub(crate) async fn new(docker_cli: &str, use_buildkit: Option<bool>) -> Self {
+    pub(crate) async fn new(
+        host: Rc<dyn ProjectHostCapability>,
+        docker_cli: &str,
+        use_buildkit: Option<bool>,
+    ) -> Self {
         let has_buildx = if docker_cli == "podman" {
             false
         } else if let Some(use_buildkit) = use_buildkit {
@@ -215,10 +221,9 @@ impl Docker {
             // multi-stage `FROM`.
             use_buildkit
         } else {
-            let output = Command::new(docker_cli)
-                .args(["buildx", "version"])
-                .output()
-                .await;
+            let mut command = HostCommand::new(docker_cli);
+            command.args(["buildx", "version"]);
+            let output = host.run(&command).await;
             output.map(|o| o.status.success()).unwrap_or(false)
         };
         if !has_buildx && docker_cli != "podman" {
@@ -227,6 +232,7 @@ impl Docker {
             );
         }
         Self {
+            host,
             docker_cli: docker_cli.to_string(),
             has_buildx,
         }
@@ -237,10 +243,10 @@ impl Docker {
     }
 
     async fn pull_image(&self, image: &String) -> Result<(), DevContainerError> {
-        let mut command = Command::new(&self.docker_cli);
-        command.args(&["pull", "--", image]);
+        let mut command = HostCommand::new(&self.docker_cli);
+        command.args(["pull", "--", image]);
 
-        let output = command.output().await.map_err(|e| {
+        let output = self.host.run(&command).await.map_err(|e| {
             log::error!("Error pulling image: {e}");
             DevContainerError::ResourceFetchFailed
         })?;
@@ -253,9 +259,9 @@ impl Docker {
         Ok(())
     }
 
-    fn create_docker_query_containers(&self, filters: Vec<String>) -> Command {
-        let mut command = Command::new(&self.docker_cli);
-        command.args(&["ps", "-a"]);
+    fn create_docker_query_containers(&self, filters: Vec<String>) -> HostCommand {
+        let mut command = HostCommand::new(&self.docker_cli);
+        command.args(["ps", "-a"]);
 
         for filter in filters {
             command.arg("--filter");
@@ -265,29 +271,29 @@ impl Docker {
         command
     }
 
-    fn create_docker_inspect(&self, id: &str) -> Command {
-        let mut command = Command::new(&self.docker_cli);
-        command.args(&["inspect", "--format={{json . }}", id]);
+    fn create_docker_inspect(&self, id: &str) -> HostCommand {
+        let mut command = HostCommand::new(&self.docker_cli);
+        command.args(["inspect", "--format={{json . }}", id]);
         command
     }
 
-    fn create_docker_compose_config_command(&self, config_files: &Vec<PathBuf>) -> Command {
-        let mut command = Command::new(&self.docker_cli);
+    fn create_docker_compose_config_command(&self, config_files: &Vec<HostPathBuf>) -> HostCommand {
+        let mut command = HostCommand::new(&self.docker_cli);
         command.arg("compose");
         for file_path in config_files {
-            command.args(&["-f", &file_path.display().to_string()]);
+            command.arg("-f").path_arg(file_path.clone());
         }
         command.arg("config");
         command
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl DockerClient for Docker {
     async fn inspect(&self, id: &String) -> Result<DockerInspect, DevContainerError> {
         // Always try inspect first — avoid pulling unless necessary.
         let command = self.create_docker_inspect(id);
-        match evaluate_json_command::<DockerInspect>(command).await {
+        match evaluate_json_command::<DockerInspect>(&*self.host, command).await {
             Ok(Some(docker_inspect)) => return Ok(docker_inspect),
             Ok(None) | Err(_) => {}
         }
@@ -296,7 +302,8 @@ impl DockerClient for Docker {
         self.pull_image(id).await.ok();
 
         let command = self.create_docker_inspect(id);
-        let Some(docker_inspect): Option<DockerInspect> = evaluate_json_command(command).await?
+        let Some(docker_inspect): Option<DockerInspect> =
+            evaluate_json_command(&*self.host, command).await?
         else {
             log::error!("Docker inspect produced no deserializable output");
             return Err(DevContainerError::CommandFailed(self.docker_cli.clone()));
@@ -306,19 +313,19 @@ impl DockerClient for Docker {
 
     async fn get_docker_compose_config(
         &self,
-        config_files: &Vec<PathBuf>,
+        config_files: &Vec<HostPathBuf>,
     ) -> Result<Option<DockerComposeConfig>, DevContainerError> {
         let command = self.create_docker_compose_config_command(config_files);
-        evaluate_yaml_command(command).await
+        evaluate_yaml_command(&*self.host, command).await
     }
 
     async fn docker_compose_build(
         &self,
-        config_files: &Vec<PathBuf>,
+        config_files: &Vec<HostPathBuf>,
         project_name: &str,
         services: Option<&Vec<String>>,
     ) -> Result<(), DevContainerError> {
-        let mut command = Command::new(&self.docker_cli);
+        let mut command = HostCommand::new(&self.docker_cli);
         if !self.is_podman() {
             if self.has_buildx {
                 command.env("DOCKER_BUILDKIT", "1");
@@ -330,25 +337,25 @@ impl DockerClient for Docker {
                 command.env("COMPOSE_DOCKER_CLI_BUILD", "0");
             }
         }
-        command.args(&["compose", "--project-name", project_name]);
+        command.args(["compose", "--project-name", project_name]);
         for docker_compose_file in config_files {
-            command.args(&["-f", &docker_compose_file.display().to_string()]);
+            command.arg("-f").path_arg(docker_compose_file.clone());
         }
         command.arg("build");
         if let Some(services) = services {
-            command.args(services);
+            command.args(services.clone());
         }
 
-        let output = command.output().await.map_err(|e| {
+        let output = self.host.run(&command).await.map_err(|e| {
             log::error!("Error running docker compose up: {e}");
-            DevContainerError::CommandFailed(command.get_program().display().to_string())
+            DevContainerError::CommandFailed(command.program().to_string())
         })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             log::error!("Non-success status from docker compose up: {}", stderr);
             return Err(DevContainerError::CommandFailed(
-                command.get_program().display().to_string(),
+                command.program().to_string(),
             ));
         }
 
@@ -360,11 +367,11 @@ impl DockerClient for Docker {
         remote_folder: &str,
         user: &str,
         env: &HashMap<String, String>,
-        inner_command: Command,
+        inner_command: HostCommand,
     ) -> Result<(), DevContainerError> {
-        let mut command = Command::new(&self.docker_cli);
+        let mut command = HostCommand::new(&self.docker_cli);
 
-        command.args(&["exec", "-w", remote_folder, "-u", user]);
+        command.args(["exec", "-w", remote_folder, "-u", user]);
 
         for (k, v) in env.iter() {
             command.arg("-e");
@@ -376,16 +383,12 @@ impl DockerClient for Docker {
 
         command.arg("sh");
 
-        let mut inner_program_script: Vec<String> =
-            vec![inner_command.get_program().display().to_string()];
-        let mut args: Vec<String> = inner_command
-            .get_args()
-            .map(|arg| arg.display().to_string())
-            .collect();
-        inner_program_script.append(&mut args);
-        command.args(&["-c", &inner_program_script.join(" ")]);
+        // Lifecycle hooks run in the created container, so the hook's program and
+        // arguments are handed to the container's shell; only the `docker exec`
+        // wrapper around them is a project-host process.
+        command.args(["-c".to_string(), inner_command.to_shell_words().join(" ")]);
 
-        let output = command.output().await.map_err(|e| {
+        let output = self.host.run(&command).await.map_err(|e| {
             log::error!("Error running command {e} in container exec");
             DevContainerError::ContainerNotValid(container_id.to_string())
         })?;
@@ -400,20 +403,20 @@ impl DockerClient for Docker {
         Ok(())
     }
     async fn start_container(&self, id: &str) -> Result<(), DevContainerError> {
-        let mut command = Command::new(&self.docker_cli);
+        let mut command = HostCommand::new(&self.docker_cli);
 
-        command.args(&["start", id]);
+        command.args(["start", id]);
 
-        let output = command.output().await.map_err(|e| {
+        let output = self.host.run(&command).await.map_err(|e| {
             log::error!("Error running docker start: {e}");
-            DevContainerError::CommandFailed(command.get_program().display().to_string())
+            DevContainerError::CommandFailed(command.program().to_string())
         })?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             log::error!("Non-success status from docker start: {stderr}");
             return Err(DevContainerError::CommandFailed(
-                command.get_program().display().to_string(),
+                command.program().to_string(),
             ));
         }
 
@@ -424,16 +427,16 @@ impl DockerClient for Docker {
         &self,
         filters: Vec<String>,
     ) -> Result<Option<DockerPs>, DevContainerError> {
-        let mut command = self.create_docker_query_containers(filters);
-        let output = command.output().await.map_err(|e| {
+        let command = self.create_docker_query_containers(filters);
+        let output = self.host.run(&command).await.map_err(|e| {
             log::error!("Error running command {:?}: {e}", command);
-            DevContainerError::CommandFailed(command.get_program().display().to_string())
+            DevContainerError::CommandFailed(command.program().to_string())
         })?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             log::error!("Non-success status from docker ps: {stderr}");
             return Err(DevContainerError::CommandFailed(
-                command.get_program().display().to_string(),
+                command.program().to_string(),
             ));
         }
         let raw = String::from_utf8_lossy(&output.stdout);
@@ -443,7 +446,7 @@ impl DockerClient for Docker {
                 e
             } else {
                 log::error!("Error parsing docker ps output: {e}");
-                DevContainerError::CommandFailed(command.get_program().display().to_string())
+                DevContainerError::CommandFailed(command.program().to_string())
             }
         })
     }
@@ -484,16 +487,16 @@ fn parse_find_process_output(raw: &str) -> Result<Option<DockerPs>, DevContainer
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 pub(crate) trait DockerClient {
     async fn inspect(&self, id: &String) -> Result<DockerInspect, DevContainerError>;
     async fn get_docker_compose_config(
         &self,
-        config_files: &Vec<PathBuf>,
+        config_files: &Vec<HostPathBuf>,
     ) -> Result<Option<DockerComposeConfig>, DevContainerError>;
     async fn docker_compose_build(
         &self,
-        config_files: &Vec<PathBuf>,
+        config_files: &Vec<HostPathBuf>,
         project_name: &str,
         services: Option<&Vec<String>>,
     ) -> Result<(), DevContainerError>;
@@ -503,7 +506,7 @@ pub(crate) trait DockerClient {
         remote_folder: &str,
         user: &str,
         env: &HashMap<String, String>,
-        inner_command: Command,
+        inner_command: HostCommand,
     ) -> Result<(), DevContainerError>;
     async fn start_container(&self, id: &str) -> Result<(), DevContainerError>;
     async fn find_process_by_filters(
@@ -754,9 +757,12 @@ where
 mod test {
     use std::{
         collections::HashMap,
-        ffi::OsStr,
         process::{ExitStatus, Output},
+        rc::Rc,
     };
+
+    use fs::FakeFs;
+    use gpui::TestAppContext;
 
     use crate::{
         command_json::deserialize_json_output,
@@ -767,29 +773,75 @@ mod test {
             DockerComposeServicePort, DockerComposeVolume, DockerInspect, DockerPs,
             parse_find_process_output,
         },
+        project_host::{HostCommand, ProjectHostCapability, test_support::RecordingProjectHost},
     };
-    #[cfg(not(target_os = "windows"))]
-    use util::command::Command;
 
-    #[test]
-    fn use_buildkit_setting_overrides_buildx_detection() {
+    const TEST_SOURCE_ROOT: &str = "/path/to/source/project";
+
+    fn recording_host(cx: &mut TestAppContext) -> Rc<RecordingProjectHost> {
+        Rc::new(RecordingProjectHost::new(
+            TEST_SOURCE_ROOT,
+            "/host/tmp",
+            FakeFs::new(cx.executor()),
+        ))
+    }
+
+    fn docker_with_host(host: Rc<dyn ProjectHostCapability>, docker_cli: &str) -> Docker {
+        Docker {
+            host,
+            docker_cli: docker_cli.to_string(),
+            has_buildx: false,
+        }
+    }
+
+    #[gpui::test]
+    async fn use_buildkit_setting_overrides_buildx_detection(cx: &mut TestAppContext) {
         // `Some(_)` short-circuits the `buildx version` probe, so these run
         // without invoking docker.
-        let forced_off = futures::executor::block_on(Docker::new("docker", Some(false)));
+        let host = recording_host(cx);
+        let forced_off = Docker::new(host.clone(), "docker", Some(false)).await;
         assert!(
             !forced_off.supports_compose_buildkit(),
             "use_buildkit=false must force the classic builder"
         );
 
-        let forced_on = futures::executor::block_on(Docker::new("docker", Some(true)));
+        let forced_on = Docker::new(host.clone(), "docker", Some(true)).await;
         assert!(
             forced_on.supports_compose_buildkit(),
             "use_buildkit=true must enable BuildKit"
         );
 
         // podman never supports the BuildKit/buildx path, regardless of the setting.
-        let podman = futures::executor::block_on(Docker::new("podman", Some(true)));
+        let podman = Docker::new(host.clone(), "podman", Some(true)).await;
         assert!(!podman.supports_compose_buildkit());
+
+        assert!(
+            host.commands().is_empty(),
+            "an explicit setting must not probe the project host"
+        );
+    }
+
+    #[gpui::test]
+    async fn buildx_detection_probes_the_project_host(cx: &mut TestAppContext) {
+        let host = recording_host(cx);
+
+        let docker = Docker::new(host.clone(), "docker", None).await;
+
+        assert!(docker.supports_compose_buildkit());
+        let probes = host.commands_by_program("docker");
+        assert_eq!(probes.len(), 1);
+        assert_eq!(probes[0].arguments(), vec!["buildx", "version"]);
+        assert_eq!(probes[0].working_directory, host.source_root().clone());
+    }
+
+    #[gpui::test]
+    async fn buildx_detection_falls_back_when_the_probe_fails(cx: &mut TestAppContext) {
+        let host = recording_host(cx);
+        host.fail_program("docker");
+
+        let docker = Docker::new(host.clone(), "docker", None).await;
+
+        assert!(!docker.supports_compose_buildkit());
     }
 
     #[test]
@@ -870,45 +922,92 @@ mod test {
         assert_eq!(labels.get("com.example.key").unwrap(), "value=with=equals");
     }
 
-    #[test]
-    fn should_create_docker_inspect_command() {
-        let docker = Docker {
-            docker_cli: "docker".to_string(),
-            has_buildx: false,
-        };
+    #[gpui::test]
+    async fn should_create_docker_inspect_command(cx: &mut TestAppContext) {
+        let docker = docker_with_host(recording_host(cx), "docker");
         let given_id = "given_docker_id";
 
         let command = docker.create_docker_inspect(given_id);
 
         assert_eq!(
-            command.get_args().collect::<Vec<&OsStr>>(),
-            vec![
-                OsStr::new("inspect"),
-                OsStr::new("--format={{json . }}"),
-                OsStr::new(given_id)
-            ]
+            command.get_args(),
+            vec!["inspect", "--format={{json . }}", given_id]
         )
     }
 
-    #[cfg(not(target_os = "windows"))]
-    #[test]
-    fn docker_exec_returns_error_on_nonzero_exit() {
-        let docker = Docker {
-            docker_cli: "false".to_string(),
-            has_buildx: false,
-        };
+    #[gpui::test]
+    async fn docker_exec_runs_the_hook_through_the_project_host(cx: &mut TestAppContext) {
+        let host = recording_host(cx);
+        let docker = docker_with_host(host.clone(), "docker");
+        let mut hook = HostCommand::new("/bin/sh");
+        hook.args(["-c", "echo hello"]);
 
-        let result = gpui::block_on(docker.run_docker_exec(
-            "container",
-            "/workspace",
-            "root",
-            &HashMap::new(),
-            Command::new("true"),
-        ));
+        let result = docker
+            .run_docker_exec("container", "/workspace", "root", &HashMap::new(), hook)
+            .await;
+
+        assert!(result.is_ok());
+        let exec = host.commands_by_program("docker");
+        assert_eq!(exec.len(), 1);
+        assert_eq!(
+            exec[0].arguments(),
+            vec![
+                "exec",
+                "-w",
+                "/workspace",
+                "-u",
+                "root",
+                "container",
+                "sh",
+                "-c",
+                "/bin/sh -c echo hello",
+            ],
+            "the hook itself belongs to the container; only `docker exec` is a host process"
+        );
+        assert_eq!(exec[0].working_directory, host.source_root().clone());
+    }
+
+    #[gpui::test]
+    async fn docker_exec_returns_error_on_nonzero_exit(cx: &mut TestAppContext) {
+        let host = recording_host(cx);
+        host.fail_program("docker");
+        let docker = docker_with_host(host, "docker");
+
+        let result = docker
+            .run_docker_exec(
+                "container",
+                "/workspace",
+                "root",
+                &HashMap::new(),
+                HostCommand::new("true"),
+            )
+            .await;
 
         assert!(matches!(
             result,
             Err(DevContainerError::DevContainerScriptsFailed)
+        ));
+    }
+
+    #[gpui::test]
+    async fn docker_exec_returns_error_when_the_host_process_cannot_start(cx: &mut TestAppContext) {
+        let host = recording_host(cx);
+        host.fail_to_start("docker");
+        let docker = docker_with_host(host, "docker");
+
+        let result = docker
+            .run_docker_exec(
+                "container",
+                "/workspace",
+                "root",
+                &HashMap::new(),
+                HostCommand::new("true"),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(DevContainerError::ContainerNotValid(id)) if id == "container"
         ));
     }
 

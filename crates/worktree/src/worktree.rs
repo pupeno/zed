@@ -6231,6 +6231,7 @@ impl BackgroundScanner {
             || entry.path.file_name() == Some(DOT_GIT)
             || entry.path.file_name() == Some(local_settings_folder_name())
             || entry.path.file_name() == Some(local_vscode_folder_name())
+            || is_dev_container_config_dir(&entry.path)
             || state.scanned_dirs.contains(&entry.id) // If we've ever scanned it, keep scanning
             || state
                 .paths_to_scan
@@ -6250,6 +6251,23 @@ impl BackgroundScanner {
         }
         Ok(request)
     }
+}
+
+/// Whether `path` is a directory that can hold a Dev Container configuration:
+/// the project's root `.devcontainer` directory, or one of its immediate
+/// subdirectories, which is where a named configuration lives.
+///
+/// These are scanned even when gitignored. Without this, a project whose root
+/// an enclosing repository ignores — a checkout parked under a `.local/` or
+/// `target/` that a parent repository excludes — has its `.devcontainer` left
+/// as an unloaded directory, so the configuration is never discovered and the
+/// project is silently treated as having none. The two anchored shapes keep the
+/// cost proportional to the configuration rather than to the ignored tree: at
+/// most the configuration directory and one level below it are loaded, and only
+/// at the worktree root.
+fn is_dev_container_config_dir(path: &RelPath) -> bool {
+    let dev_container_dir = paths::local_dev_container_folder_path();
+    path == dev_container_dir || path.parent() == Some(dev_container_dir)
 }
 
 async fn discover_ancestor_git_repo(

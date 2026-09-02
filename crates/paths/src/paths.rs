@@ -493,6 +493,17 @@ pub fn local_vscode_folder_name() -> &'static str {
     ".vscode"
 }
 
+/// Returns the relative path to a `.devcontainer` folder within a project.
+///
+/// This is the only place a Dev Container configuration directory is looked
+/// for, so it is also what the worktree scanner uses to decide the directory
+/// must be loaded even when it is gitignored.
+pub fn local_dev_container_folder_path() -> &'static RelPath {
+    static CACHED: LazyLock<&'static RelPath> =
+        LazyLock::new(|| RelPath::from_unix_str(".devcontainer").unwrap());
+    *CACHED
+}
+
 /// Returns the relative path to a `settings.json` file within a project.
 pub fn local_settings_file_relative_path() -> &'static RelPath {
     static CACHED: LazyLock<&'static RelPath> =

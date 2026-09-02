@@ -38,7 +38,9 @@ pub use remote_servers::RemoteServerProjects;
 use settings::{DefaultOpenBehavior, Settings, WorktreeId};
 use workspace::ProjectGroupKey;
 
-use dev_container::{DevContainerContext, find_devcontainer_configs};
+use dev_container::{
+    DevContainerContext, find_devcontainer_configs, is_supported_dev_container_source_connection,
+};
 use ui::{
     ButtonLike, ContextMenu, Divider, HighlightedLabel, KeyBinding, ListItem, ListItemSpacing,
     ListSubHeader, PopoverMenu, PopoverMenuHandle, TintColor, Tooltip, prelude::*,
@@ -505,12 +507,21 @@ pub fn init(cx: &mut App) {
 
     cx.on_action(|_: &OpenDevContainer, cx| {
         with_active_or_new_workspace(cx, move |workspace, window, cx| {
-            if !workspace.project().read(cx).is_local() {
+            let supported_source = {
+                let project = workspace.project();
+                let project = project.read(cx);
+                project.is_local()
+                    || project
+                        .remote_connection_options(cx)
+                        .as_ref()
+                        .is_some_and(is_supported_dev_container_source_connection)
+            };
+            if !supported_source {
                 cx.spawn_in(window, async move |_, cx| {
                     cx.prompt(
                         gpui::PromptLevel::Critical,
-                        "Cannot open Dev Container from remote project",
-                        None,
+                        "Cannot open Dev Container from this project",
+                        Some("Open the original local, SSH, or WSL project instead."),
                         &["OK"],
                     )
                     .await
@@ -539,16 +550,25 @@ pub fn init(cx: &mut App) {
         });
     });
 
-    // Subscribe to worktree additions to suggest opening the project in a dev container
+    // Suggest opening the project in a dev container, both for what it already
+    // contains and for anything that arrives later.
     cx.observe_new(
         |workspace: &mut Workspace, window: Option<&mut Window>, cx: &mut Context<Workspace>| {
             let Some(window) = window else {
                 return;
             };
+
+            let offered = dev_container_suggest::OfferedWorktrees::default();
+
+            // A project's entries are often all delivered before the workspace
+            // that would observe them exists, so ask what the project holds now
+            // rather than relying on a change event that may already be past.
+            dev_container_suggest::suggest_for_project_state(workspace, &offered, window, cx);
+
             cx.subscribe_in(
                 workspace.project(),
                 window,
-                move |workspace, project, event, window, cx| {
+                move |workspace, _project, event, window, cx| {
                     if let project::Event::WorktreeUpdatedEntries(worktree_id, updated_entries) =
                         event
                     {
@@ -556,7 +576,7 @@ pub fn init(cx: &mut App) {
                             workspace,
                             *worktree_id,
                             updated_entries,
-                            project,
+                            &offered,
                             window,
                             cx,
                         );
@@ -1995,6 +2015,7 @@ pub(crate) fn icon_for_remote_connection(options: Option<&RemoteConnectionOption
             RemoteConnectionOptions::Ssh(_) => IconName::Server,
             RemoteConnectionOptions::Wsl(_) => IconName::Linux,
             RemoteConnectionOptions::Docker(_) => IconName::Box,
+            RemoteConnectionOptions::HostDocker(_) => IconName::Box,
             #[cfg(any(test, feature = "test-support"))]
             RemoteConnectionOptions::Mock(_) => IconName::Server,
         },

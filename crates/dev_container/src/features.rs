@@ -1,12 +1,13 @@
-use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use std::collections::HashMap;
 
-use fs::Fs;
+use remote::HostPathBuf;
 use serde::Deserialize;
 use serde_json_lenient::Value;
 
 use crate::{
     devcontainer_api::DevContainerError,
     devcontainer_json::{FeatureOptions, MountDefinition},
+    project_host::ProjectHostCapability,
     safe_id_upper,
 };
 
@@ -68,11 +69,11 @@ impl FeatureOptionDefinition {
     }
 }
 
-#[derive(Debug, Eq, PartialEq, Default)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct FeatureManifest {
     consecutive_id: String,
     user_feature_id: String,
-    file_path: PathBuf,
+    file_path: HostPathBuf,
     feature_json: DevContainerFeatureJson,
 }
 
@@ -80,7 +81,7 @@ impl FeatureManifest {
     pub(crate) fn new(
         consecutive_id: String,
         user_feature_id: String,
-        file_path: PathBuf,
+        file_path: HostPathBuf,
         feature_json: DevContainerFeatureJson,
     ) -> Self {
         Self {
@@ -167,7 +168,7 @@ RUN chmod -R 0755 {full_dest} \
 
     pub(crate) async fn write_feature_env(
         &self,
-        fs: &Arc<dyn Fs>,
+        host: &dyn ProjectHostCapability,
         options: &FeatureOptions,
     ) -> Result<String, DevContainerError> {
         let merged_env = self.generate_merged_env(options);
@@ -179,7 +180,7 @@ RUN chmod -R 0755 {full_dest} \
             .iter()
             .fold("".to_string(), |acc, (k, v)| format!("{acc}{}={}\n", k, v));
 
-        fs.write(
+        host.write_file(
             &self.file_path.join("devcontainer-features.env"),
             env_file_content.as_bytes(),
         )
@@ -220,7 +221,7 @@ RUN chmod -R 0755 {full_dest} \
         self.feature_json.security_opt.clone().unwrap_or_default()
     }
 
-    pub(crate) fn file_path(&self) -> PathBuf {
+    pub(crate) fn file_path(&self) -> HostPathBuf {
         self.file_path.clone()
     }
 

@@ -1,10 +1,15 @@
 pub mod json_log;
+mod project_host;
 pub mod protocol;
 pub mod proxy;
 pub mod remote_client;
 pub mod remote_identity;
 mod transport;
 
+pub use project_host::{
+    HostPathBuf, HostProcess, HostProcessOutcome, HostProcessRequest, ProjectHost, ProjectHostKind,
+    ProjectHostPlatform,
+};
 #[cfg(target_os = "windows")]
 pub use remote_client::OpenWslPath;
 pub use remote_client::{
@@ -15,7 +20,9 @@ pub use remote_client::{
 pub use remote_identity::{
     RemoteConnectionIdentity, remote_connection_identity, same_remote_connection_identity,
 };
-pub use transport::docker::DockerConnectionOptions;
+pub use transport::docker::{
+    DockerConnectionOptions, HostDockerConnectionOptions, ProjectHostConnectionOptions,
+};
 pub use transport::ssh::{SshConnectionOptions, SshPortForwardOption};
 pub use transport::wsl::WslConnectionOptions;
 #[cfg(target_os = "windows")]
